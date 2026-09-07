@@ -36,6 +36,7 @@ local Flags = {
     AutoSpin = false,
     AutoGift = false,
     AutoTrofeu = false,
+    Noclip = false,
     AntiAFK = true,
 }
 
@@ -53,6 +54,7 @@ local function hum()
 end
 
 -- anda ate uma posicao (MoveTo = andar de verdade, sem kick por teleporte)
+-- com anti-travamento: se ficar parado, pula e tenta de novo
 -- retorna true quando chega ou false se cancelado
 local function andarAte(pos, flagName, timeout)
     local h = hum()
@@ -61,6 +63,8 @@ local function andarAte(pos, flagName, timeout)
 
     timeout = timeout or 30
     local inicio = tick()
+    local ultimaPos = root.Position
+    local ultimoProgresso = tick()
 
     while flagName == nil or Flags[flagName] do
         root = hrp()
@@ -71,11 +75,33 @@ local function andarAte(pos, flagName, timeout)
         if dist < 6 then return true end
         if tick() - inicio > timeout then return false end
 
+        -- anti-travamento: se nao saiu do lugar em 3s, pula
+        if (root.Position - ultimaPos).Magnitude > 1 then
+            ultimaPos = root.Position
+            ultimoProgresso = tick()
+        elseif tick() - ultimoProgresso > 3 then
+            h.Jump = true
+            ultimoProgresso = tick()
+        end
+
         h:MoveTo(pos)
         task.wait(0.5)
     end
     return false
 end
+
+-- noclip: atravessa paredes/obstaculos enquanto ligado
+RunService.Stepped:Connect(function()
+    if not Flags.Noclip then return end
+    local c = LP.Character
+    if c then
+        for _, p in ipairs(c:GetDescendants()) do
+            if p:IsA("BasePart") and p.CanCollide then
+                p.CanCollide = false
+            end
+        end
+    end
+end)
 
 -- acha a primeira BasePart dentro de um modelo/folder
 local function acharPart(obj)
@@ -303,7 +329,10 @@ local function acharTrofeu()
 end
 
 -- anda ate o trofeu: usa a posicao fixa da ultima fase; se nao chegar, tenta achar por nome
+-- liga noclip durante o percurso pra nao travar em parede/porta
 local function irAoTrofeu(flagName)
+    local noclipAntes = Flags.Noclip
+    Flags.Noclip = true
     -- caminho principal: posicao fixa confirmada
     local chegou = andarAte(TROFEU_CF.Position, flagName, 180)
     if not chegou then
@@ -313,6 +342,7 @@ local function irAoTrofeu(flagName)
             chegou = andarAte(trofeu.Position, flagName, 120)
         end
     end
+    Flags.Noclip = noclipAntes
     return chegou
 end
 
@@ -477,6 +507,28 @@ RebirthTab:Toggle({
 --  TAB: CONFIG
 --==================================================================--
 local ConfigTab = Window:Tab({ Title = "Config", Icon = "settings" })
+
+ConfigTab:Section({ Title = "Movimento" })
+
+ConfigTab:Toggle({
+    Title = "Noclip",
+    Desc = "Atravessa paredes e obstaculos — fica ligado ate voce desligar",
+    Value = false,
+    Callback = function(v)
+        Flags.Noclip = v
+        if not v then
+            -- ao desligar, restaura colisao do personagem
+            local c = LP.Character
+            if c then
+                for _, p in ipairs(c:GetDescendants()) do
+                    if p:IsA("BasePart") then
+                        pcall(function() p.CanCollide = true end)
+                    end
+                end
+            end
+        end
+    end,
+})
 
 ConfigTab:Section({ Title = "Protecao" })
 
