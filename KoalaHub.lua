@@ -255,6 +255,9 @@ local TrofeuTab = Window:Tab({ Title = "Troféu", Icon = "trophy" })
 
 TrofeuTab:Section({ Title = "Fases" })
 
+-- posicao exata do trofeu da ultima fase (confirmada in-game)
+local TROFEU_CF = CFrame.new(-16.921936, -3.63867998, 3353.7356, -1, 0, 0, 0, 1, 0, 0, 0, -1)
+
 -- nomes que o trofeu/win pode ter no mapa
 local TROFEU_NOMES = { "trofeu", "trophy", "win", "goal", "finish", "recompensa", "prize", "podio", "podium" }
 
@@ -299,39 +302,46 @@ local function acharTrofeu()
     return nil
 end
 
+-- anda ate o trofeu: usa a posicao fixa da ultima fase; se nao chegar, tenta achar por nome
+local function irAoTrofeu(flagName)
+    -- caminho principal: posicao fixa confirmada
+    local chegou = andarAte(TROFEU_CF.Position, flagName, 180)
+    if not chegou then
+        -- fallback: busca por nome no mapa
+        local trofeu = acharTrofeu()
+        if trofeu then
+            chegou = andarAte(trofeu.Position, flagName, 120)
+        end
+    end
+    return chegou
+end
+
+-- encosta no trofeu e avisa o servidor
+local function coletarTrofeu()
+    local root = hrp()
+    if root then
+        root.CFrame = TROFEU_CF + Vector3.new(0, 2, 0)
+    end
+    pcall(function()
+        Remotes.MostrarWin:FireServer()
+    end)
+end
+
 TrofeuTab:Toggle({
     Title = "Auto Troféu (andando)",
-    Desc = "Anda ate a ultima fase e coleta o trofeu — sem teleporte, sem kick",
+    Desc = "Anda ate o trofeu da ultima fase e coleta — sem teleporte, sem kick",
     Value = false,
     Callback = function(v)
         Flags.AutoTrofeu = v
         if v then
             task.spawn(function()
                 while Flags.AutoTrofeu do
-                    local trofeu = acharTrofeu()
-                    if trofeu then
-                        local chegou = andarAte(trofeu.Position, "AutoTrofeu", 120)
-                        if chegou then
-                            -- encosta no trofeu pra coletar
-                            local root = hrp()
-                            if root then
-                                -- pequeno ajuste final pra tocar
-                                root.CFrame = trofeu.CFrame + Vector3.new(0, 2, 0)
-                            end
-                            pcall(function()
-                                Remotes.MostrarWin:FireServer()
-                            end)
-                            task.wait(3)
-                        else
-                            task.wait(2)
-                        end
+                    local chegou = irAoTrofeu("AutoTrofeu")
+                    if chegou then
+                        coletarTrofeu()
+                        task.wait(3)
                     else
-                        Koala:Notify({
-                            Title = "Koala Hub",
-                            Content = "Trofeu nao encontrado no mapa. Tentando de novo...",
-                            Duration = 4,
-                        })
-                        task.wait(5)
+                        task.wait(2)
                     end
                 end
             end)
@@ -344,13 +354,13 @@ TrofeuTab:Button({
     Desc = "Anda ate o trofeu uma unica vez",
     Callback = function()
         task.spawn(function()
-            local trofeu = acharTrofeu()
-            if trofeu then
-                andarAte(trofeu.Position, nil, 120)
+            local chegou = irAoTrofeu(nil)
+            if chegou then
+                coletarTrofeu()
             else
                 Koala:Notify({
                     Title = "Koala Hub",
-                    Content = "Trofeu nao encontrado no mapa.",
+                    Content = "Nao consegui chegar no trofeu.",
                     Duration = 4,
                 })
             end
