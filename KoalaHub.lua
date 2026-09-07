@@ -6,7 +6,7 @@
     ██║  ██╗╚██████╔╝██║  ██║███████╗██║  ██║    ██║  ██║╚██████╔╝██████╔╝
     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝    ╚═╝  ╚═╝ ╚═════╝ ╚═════╝
 
-    KOALA HUB v1.3.0 — [👑] +1 Clique Por Ego
+    KOALA HUB v1.4.0 — [👑] +1 Clique Por Ego
     UI: WindUI (clone Koala UI v3)
     Discord: https://discord.gg/ZRFffEgQQM
 
