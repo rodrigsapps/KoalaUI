@@ -6,7 +6,7 @@
     ██║  ██╗╚██████╔╝██║  ██║███████╗██║  ██║    ██║  ██║╚██████╔╝██████╔╝
     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝    ╚═╝  ╚═╝ ╚═════╝ ╚═════╝
 
-    KOALA HUB v1.1.0 — [👑] +1 Clique Por Ego
+    KOALA HUB v1.2.0 — [👑] +1 Clique Por Ego
     UI: WindUI (clone Koala UI v3)
     Discord: https://discord.gg/ZRFffEgQQM
 
@@ -35,6 +35,7 @@ local Flags = {
     AutoRebirth = false,
     AutoSpin = false,
     AutoGift = false,
+    AutoTrofeu = false,
     AntiAFK = true,
 }
 
@@ -46,9 +47,41 @@ local function hrp()
     return c and c:FindFirstChild("HumanoidRootPart")
 end
 
-local function tpTo(cf)
+local function hum()
+    local c = LP.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+-- anda ate uma posicao (MoveTo = andar de verdade, sem kick por teleporte)
+-- retorna true quando chega ou false se cancelado
+local function andarAte(pos, flagName, timeout)
+    local h = hum()
     local root = hrp()
-    if root then root.CFrame = cf end
+    if not h or not root then return false end
+
+    timeout = timeout or 30
+    local inicio = tick()
+
+    while flagName == nil or Flags[flagName] do
+        root = hrp()
+        h = hum()
+        if not root or not h or h.Health <= 0 then return false end
+
+        local dist = (root.Position - pos).Magnitude
+        if dist < 6 then return true end
+        if tick() - inicio > timeout then return false end
+
+        h:MoveTo(pos)
+        task.wait(0.5)
+    end
+    return false
+end
+
+-- acha a primeira BasePart dentro de um modelo/folder
+local function acharPart(obj)
+    if not obj then return nil end
+    if obj:IsA("BasePart") then return obj end
+    return obj:FindFirstChildWhichIsA("BasePart", true)
 end
 
 -- anti-kick AFK (simula atividade leve, sem mexer o personagem)
@@ -126,7 +159,6 @@ pcall(function()
         local mult = m.Name:match("Conveyor_(%d+)x")
         if mult then
             local label = "Esteira " .. mult .. "x"
-            -- evita duplicata (tem 2x Conveyor_1x no mapa)
             if not esteiraMap[label] then
                 table.insert(esteiraNames, label)
                 esteiraMap[label] = m
@@ -138,7 +170,7 @@ pcall(function()
     end)
 end)
 
-local esteiraSelecionada = esteiraNames[#esteiraNames] -- melhor por padrao
+local esteiraSelecionada = esteiraNames[#esteiraNames]
 
 FarmTab:Dropdown({
     Title = "Esteira",
@@ -151,29 +183,40 @@ FarmTab:Dropdown({
 })
 
 FarmTab:Toggle({
-    Title = "Auto Esteira",
-    Desc = "Teleporta UMA vez pra esteira e fica farmando parado (sem ficar voltando)",
+    Title = "Auto Esteira (andando)",
+    Desc = "ANDA ate a esteira escolhida e fica farmando — sem teleporte, sem kick",
     Value = false,
     Callback = function(v)
         Flags.AutoEsteira = v
         if v then
             task.spawn(function()
-                -- teleporta uma unica vez pra nao dar kick por teleporte excessivo
-                pcall(function()
-                    local model = esteiraMap[esteiraSelecionada]
-                    if model then
-                        local part = model:FindFirstChildWhichIsA("BasePart", true)
-                        if part then
-                            tpTo(part.CFrame + Vector3.new(0, 3, 0))
-                        end
-                    end
-                end)
-                -- depois so mantem o auto click ligado enquanto estiver na esteira
                 while Flags.AutoEsteira do
-                    pcall(function()
-                        Remotes.ClicouParaGanharEgo:FireServer()
-                    end)
-                    task.wait(0.05)
+                    local model = esteiraMap[esteiraSelecionada]
+                    local part = acharPart(model)
+                    if part then
+                        -- anda ate a esteira
+                        local chegou = andarAte(part.Position + Vector3.new(0, 0, 0), "AutoEsteira", 60)
+                        if chegou then
+                            -- chegou: fica parado farmando
+                            local h = hum()
+                            if h then h:MoveTo(hrp().Position) end
+                            while Flags.AutoEsteira do
+                                pcall(function()
+                                    Remotes.ClicouParaGanharEgo:FireServer()
+                                end)
+                                task.wait(0.05)
+                                -- se caiu/morreu, volta a andar
+                                local root = hrp()
+                                if not root or (root.Position - part.Position).Magnitude > 12 then
+                                    break
+                                end
+                            end
+                        else
+                            task.wait(1)
+                        end
+                    else
+                        task.wait(1)
+                    end
                 end
             end)
         end
@@ -202,6 +245,116 @@ FarmTab:Toggle({
                 end
             end)
         end
+    end,
+})
+
+--==================================================================--
+--  TAB: TROFEU
+--==================================================================--
+local TrofeuTab = Window:Tab({ Title = "Troféu", Icon = "trophy" })
+
+TrofeuTab:Section({ Title = "Fases" })
+
+-- nomes que o trofeu/win pode ter no mapa
+local TROFEU_NOMES = { "trofeu", "trophy", "win", "goal", "finish", "recompensa", "prize", "podio", "podium" }
+
+local function acharTrofeu()
+    -- procura nas fases primeiro (da ultima pra primeira)
+    local phases = Workspace:FindFirstChild("Gameplay") and Workspace.Gameplay:FindFirstChild("Phases")
+    if phases then
+        local nums = {}
+        for _, f in ipairs(phases:GetChildren()) do
+            local n = tonumber(f.Name)
+            if n then table.insert(nums, n) end
+        end
+        table.sort(nums, function(a, b) return a > b end)
+        for _, n in ipairs(nums) do
+            local pasta = phases:FindFirstChild(tostring(n))
+            if pasta then
+                for _, d in ipairs(pasta:GetDescendants()) do
+                    if d:IsA("BasePart") then
+                        local nm = d.Name:lower()
+                        for _, padrao in ipairs(TROFEU_NOMES) do
+                            if nm:find(padrao) then return d end
+                        end
+                    end
+                end
+            end
+        end
+        -- fallback: ultima fase, qualquer parte
+        if #nums > 0 then
+            local ultima = phases:FindFirstChild(tostring(nums[1]))
+            return acharPart(ultima)
+        end
+    end
+    -- procura no workspace inteiro
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("BasePart") then
+            local nm = d.Name:lower()
+            for _, padrao in ipairs(TROFEU_NOMES) do
+                if nm:find(padrao) then return d end
+            end
+        end
+    end
+    return nil
+end
+
+TrofeuTab:Toggle({
+    Title = "Auto Troféu (andando)",
+    Desc = "Anda ate a ultima fase e coleta o trofeu — sem teleporte, sem kick",
+    Value = false,
+    Callback = function(v)
+        Flags.AutoTrofeu = v
+        if v then
+            task.spawn(function()
+                while Flags.AutoTrofeu do
+                    local trofeu = acharTrofeu()
+                    if trofeu then
+                        local chegou = andarAte(trofeu.Position, "AutoTrofeu", 120)
+                        if chegou then
+                            -- encosta no trofeu pra coletar
+                            local root = hrp()
+                            if root then
+                                -- pequeno ajuste final pra tocar
+                                root.CFrame = trofeu.CFrame + Vector3.new(0, 2, 0)
+                            end
+                            pcall(function()
+                                Remotes.MostrarWin:FireServer()
+                            end)
+                            task.wait(3)
+                        else
+                            task.wait(2)
+                        end
+                    else
+                        Koala:Notify({
+                            Title = "Koala Hub",
+                            Content = "Trofeu nao encontrado no mapa. Tentando de novo...",
+                            Duration = 4,
+                        })
+                        task.wait(5)
+                    end
+                end
+            end)
+        end
+    end,
+})
+
+TrofeuTab:Button({
+    Title = "Andar até o Troféu (1x)",
+    Desc = "Anda ate o trofeu uma unica vez",
+    Callback = function()
+        task.spawn(function()
+            local trofeu = acharTrofeu()
+            if trofeu then
+                andarAte(trofeu.Position, nil, 120)
+            else
+                Koala:Notify({
+                    Title = "Koala Hub",
+                    Content = "Trofeu nao encontrado no mapa.",
+                    Duration = 4,
+                })
+            end
+        end)
     end,
 })
 
@@ -242,7 +395,6 @@ RewardTab:Toggle({
         if v then
             task.spawn(function()
                 while Flags.AutoGift do
-                    -- tenta ids numericos de 1 a 12 (padrao de gifts por tempo)
                     for id = 1, 12 do
                         if not Flags.AutoGift then break end
                         pcall(function()
@@ -342,12 +494,7 @@ ConfigTab:Button({
     Title = "Fechar Hub",
     Desc = "Destroi a interface",
     Callback = function()
-        Flags.AutoClick = false
-        Flags.AutoEsteira = false
-        Flags.AutoUpgrade = false
-        Flags.AutoRebirth = false
-        Flags.AutoSpin = false
-        Flags.AutoGift = false
+        for k in pairs(Flags) do Flags[k] = false end
         pcall(function() Koala.ScreenGui:Destroy() end)
     end,
 })
