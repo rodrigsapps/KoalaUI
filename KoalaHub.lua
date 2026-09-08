@@ -562,6 +562,14 @@ ConfigTab:Button({
 })
 
 --==================================================================--
+--  TAB: AUTO FASE (GRAVADOR + ANTI-LAG)
+--==================================================================--
+pcall(function()
+    local Gravador = loadstring(game:HttpGet("https://raw.githubusercontent.com/rodrigsapps/KoalaUI/main/KoalaGravador.lua"))()
+    Gravador(Koala, Window, Flags)
+end)
+
+--==================================================================--
 --  NOTIFICACAO INICIAL
 --==================================================================--
 Koala:Notify({
