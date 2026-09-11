@@ -281,6 +281,9 @@ local TrofeuTab = Window:Tab({ Title = "Troféu", Icon = "trophy" })
 
 TrofeuTab:Section({ Title = "Fases" })
 
+-- parada intermediaria antes do trofeu (confirmada in-game)
+local WAYPOINT_CF = CFrame.new(1.73839474, 3.70700216, 3370.41187, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+
 -- posicao exata do trofeu da ultima fase (confirmada in-game)
 local TROFEU_CF = CFrame.new(-16.921936, -3.63867998, 3353.7356, -1, 0, 0, 0, 1, 0, 0, 0, -1)
 
@@ -328,12 +331,17 @@ local function acharTrofeu()
     return nil
 end
 
--- anda ate o trofeu: usa a posicao fixa da ultima fase; se nao chegar, tenta achar por nome
+-- anda ate o trofeu em duas etapas: primeiro o waypoint intermediario,
+-- depois a posicao fixa da ultima fase; se nao chegar, tenta achar por nome
 -- liga noclip durante o percurso pra nao travar em parede/porta
 local function irAoTrofeu(flagName)
     local noclipAntes = Flags.Noclip
     Flags.Noclip = true
-    -- caminho principal: posicao fixa confirmada
+
+    -- etapa 1: waypoint intermediario (nao aborta se falhar, so segue pro trofeu)
+    andarAte(WAYPOINT_CF.Position, flagName, 90)
+
+    -- etapa 2: posicao fixa do trofeu
     local chegou = andarAte(TROFEU_CF.Position, flagName, 180)
     if not chegou then
         -- fallback: busca por nome no mapa
