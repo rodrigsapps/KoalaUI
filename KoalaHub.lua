@@ -407,6 +407,96 @@ TrofeuTab:Button({
 })
 
 --==================================================================--
+--  TAB: MUNDO 2 (AUTO TROFEU)
+--==================================================================--
+local Mundo2Tab = Window:Tab({ Title = "Mundo 2", Icon = "trophy" })
+
+Mundo2Tab:Section({ Title = "Fases" })
+
+-- parada intermediaria antes do trofeu do mundo 2 (confirmada in-game)
+local WAYPOINT2_CF = CFrame.new(1.77526236, 51.5418472, 1679.36121, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+
+-- posicao exata do trofeu do mundo 2 (confirmada in-game)
+local TROFEU2_CF = CFrame.new(-16.756073, 44.2351036, 1664.03296, -1, 0, 0, 0, 1, 0, 0, 0, -1)
+
+-- anda ate o trofeu do mundo 2 em duas etapas: primeiro o waypoint
+-- intermediario, depois a posicao fixa; se nao chegar, tenta achar por nome
+-- liga noclip durante o percurso pra nao travar em parede/porta
+local function irAoTrofeu2(flagName)
+    local noclipAntes = Flags.Noclip
+    Flags.Noclip = true
+
+    -- etapa 1: waypoint intermediario (nao aborta se falhar, so segue pro trofeu)
+    andarAte(WAYPOINT2_CF.Position, flagName, 90)
+
+    -- etapa 2: posicao fixa do trofeu
+    local chegou = andarAte(TROFEU2_CF.Position, flagName, 180)
+    if not chegou then
+        -- fallback: busca por nome no mapa (mesma heuristica do mundo 1)
+        local trofeu = acharTrofeu()
+        if trofeu then
+            chegou = andarAte(trofeu.Position, flagName, 120)
+        end
+    end
+    Flags.Noclip = noclipAntes
+    return chegou
+end
+
+-- encosta no trofeu do mundo 2 e avisa o servidor
+local function coletarTrofeu2()
+    local root = hrp()
+    if root then
+        root.CFrame = TROFEU2_CF + Vector3.new(0, 2, 0)
+    end
+    pcall(function()
+        Remotes.MostrarWin:FireServer()
+    end)
+end
+
+Flags.AutoTrofeu2 = false
+
+Mundo2Tab:Toggle({
+    Title = "Auto Troféu (Mundo 2)",
+    Desc = "Anda ate o trofeu do mundo 2 e coleta — sem teleporte, sem kick",
+    Value = false,
+    Callback = function(v)
+        Flags.AutoTrofeu2 = v
+        if v then
+            task.spawn(function()
+                while Flags.AutoTrofeu2 do
+                    local chegou = irAoTrofeu2("AutoTrofeu2")
+                    if chegou then
+                        coletarTrofeu2()
+                        task.wait(3)
+                    else
+                        task.wait(2)
+                    end
+                end
+            end)
+        end
+    end,
+})
+
+Mundo2Tab:Button({
+    Title = "Andar até o Troféu (Mundo 2, 1x)",
+    Desc = "Anda ate o trofeu do mundo 2 uma unica vez",
+    Callback = function()
+        task.spawn(function()
+            local chegou = irAoTrofeu2(nil)
+            if chegou then
+                coletarTrofeu2()
+            else
+                Koala:Notify({
+                    Title = "Koala Hub",
+                    Content = "Nao consegui chegar no trofeu do Mundo 2.",
+                    Duration = 4,
+                })
+            end
+        end)
+    end,
+})
+
+--==================================================================--
 --  TAB: RECOMPENSAS
 --==================================================================--
 local RewardTab = Window:Tab({ Title = "Recompensas", Icon = "gift" })
