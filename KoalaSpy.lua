@@ -266,25 +266,22 @@ local function ligarSpy()
         return true
     end
 
-    -- metodo 2: hookfunction nos metodos das classes (fallback)
+    -- metodo 2: hookfunction nos metodos das CLASSES (fallback, pega todas as instancias)
     if hookfunction then
-        local re = Instance.new("RemoteEvent")
-        local rf = Instance.new("RemoteFunction")
         local okFire = pcall(function()
             local velho
-            velho = hookfunction(re.FireServer, newcclosure(function(self, ...)
+            velho = hookfunction(Instance.new("RemoteEvent").FireServer, newcclosure(function(self, ...)
                 pcall(logarChamada, self, "FireServer", { ... })
                 return velho(self, ...)
             end))
         end)
         local okInvoke = pcall(function()
             local velho
-            velho = hookfunction(rf.InvokeServer, newcclosure(function(self, ...)
+            velho = hookfunction(Instance.new("RemoteFunction").InvokeServer, newcclosure(function(self, ...)
                 pcall(logarChamada, self, "InvokeServer", { ... })
                 return velho(self, ...)
             end))
         end)
-        re:Destroy(); rf:Destroy()
         if okFire or okInvoke then
             spyLigado = true
             return true
