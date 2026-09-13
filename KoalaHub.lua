@@ -668,6 +668,14 @@ pcall(function()
 end)
 
 --==================================================================--
+--  TAB: SPY (DUMP + SPY DE REMOTES -> DISCORD)
+--==================================================================--
+pcall(function()
+    local Spy = loadstring(game:HttpGet("https://raw.githubusercontent.com/rodrigsapps/KoalaUI/main/KoalaSpy.lua"))()
+    Spy(Koala, Window, Flags)
+end)
+
+--==================================================================--
 --  NOTIFICACAO INICIAL
 --==================================================================--
 Koala:Notify({
