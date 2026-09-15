@@ -42,15 +42,32 @@ local LP = Players.LocalPlayer
 
 --==================================================================--
 --  REMOTES / REFS (do dump do KoalaSpy)
+--  v3.1: resolucao SEGURA — antes era WaitForChild infinito no top
+--  level: se QUALQUER remote faltasse/mudasse de nome, o script
+--  congelava aqui e a GUI nunca aparecia ("executou e nada").
+--  Agora cada um tem timeout de 8s e avisa no console (F9) o que
+--  faltou, e a GUI sobe mesmo assim.
 --==================================================================--
+local function achar(caminho, timeout)
+    local atual = ReplicatedStorage
+    for _, parte in ipairs(caminho) do
+        atual = atual:FindFirstChild(parte) or atual:WaitForChild(parte, timeout or 8)
+        if not atual then
+            warn("[KoalaC&V] FALTA: ReplicatedStorage." .. table.concat(caminho, "."))
+            return nil
+        end
+    end
+    return atual
+end
+
 local R = {
-    Teleport    = ReplicatedStorage:WaitForChild("RemoteEvents"):WaitForChild("Teleport"),
-    SellAll     = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SellAll"),
-    SellTool    = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SellTool"),
-    BuyAxe      = ReplicatedStorage:WaitForChild("BuyAxe"),      -- machado de gelo (450$)
-    BuyFireAxe  = ReplicatedStorage:WaitForChild("BuyFireAxe"),  -- machado de fogo (850$)
-    UpdateWS    = ReplicatedStorage:WaitForChild("UpdateWalkspeed"),
-    DropTool    = ReplicatedStorage:WaitForChild("DropTool"),
+    Teleport    = achar({"RemoteEvents", "Teleport"}),
+    SellAll     = achar({"Remotes", "SellAll"}),
+    SellTool    = achar({"Remotes", "SellTool"}),
+    BuyAxe      = achar({"BuyAxe"}),      -- machado de gelo (450$)
+    BuyFireAxe  = achar({"BuyFireAxe"}),  -- machado de fogo (850$)
+    UpdateWS    = achar({"UpdateWalkspeed"}),
+    DropTool    = achar({"DropTool"}),
 }
 
 -- nomes REAIS das Tools que o jogo da ao comprar (descobertos no dump)
@@ -102,7 +119,12 @@ local function andarAte(pos, timeout)
     return false
 end
 
+local avisouTP = false
 local function tpRemote(pos)
+    if not R.Teleport then
+        if not avisouTP then avisouTP = true notify("TP", "remote Teleport nao achado", 3) end
+        return
+    end
     pcall(function() R.Teleport:FireServer(pos) end)
 end
 
