@@ -1,35 +1,36 @@
 --[[
     KOALA HUB — CORTAR E VENDER (Chop & Sell) — PlaceId 122642804419736
     -------------------------------------------------------------------
-    Script especifico pro jogo "[BETA] Cortar e Vender", montado a partir
-    do dump (remotes + fontes decompiladas) extraido pelo KoalaSpy.
+    v3 — CORRIGIDO: nada mais de clone visual.
 
-    Features:
-      * PEGAR QUALQUER MACHADO — clona do ReplicatedStorage.MachadosCorta
-        pro seu Backpack (machado, angelical, gelo, fogo, demon) sem pagar.
-      * SPAWNAR TRONCOS — TRONCO / TRONCO DE OURO / TRONCO DE DIAMANTE
-        direto no Backpack (eles sao Tools em ReplicatedStorage).
-      * VENDER TUDO — chama Remotes.SellAll (RemoteFunction).
-      * AUTO FARM — loop: equipa machado -> anda ate a arvore mais
-        proxima -> ativa a Tool -> pega troncos do chao -> vende quando
-        a mochila encher (ou a cada N cortes).
-      * AUTO VENDER — vende tudo a cada X segundos.
-      * TELEPORTE — usa o remote do jogo (Teleport:FireServer(Vector3))
-        + botoes pras zonas FARM1/2/3 e SELL, e teleporte direto via
-        CFrame (instantaneo, mais arriscado).
-      * SPEED — via remote UpdateWalkspeed do jogo + WalkSpeed direto.
-      * COLETAR BAUS — anda ate cada Bau (Comum/Raro/Mitico) do mapa.
+    O que o dump mostrou (e por que a v2 falhou):
+      * Clonar Tools do ReplicatedStorage NAO funciona — o servidor
+        mantem o registro do que voce comprou/tem; clones client-side
+        sao ignorados no corte e na venda.
+      * O caminho real e usar os REMOTES DE COMPRA do jogo:
+        BuyAxe (machado de gelo, 450$) e BuyFireAxe (fogo, 850$).
+        Eles registram a Tool no servidor -> corta e vende de verdade.
+      * Machado "demon" e "angelical" nao tem remote de compra publico
+        no dump — so via gamepass/loja Robux. Sem exploit.
 
-    ATENCAO (risco de ban): BuyAxe/BuyFireAxe/SellAll sao validados no
-    servidor (a UI mostra "SEM_DINHEIRO"), entao dinheiro NAO da pra
-    forjar — mas CLONAR TOOLS do ReplicatedStorage pula a loja
-    inteira. Teleport remote aparentemente nao valida posicao.
+    O que ESTE script faz:
+      * COMPRAR machados de verdade via BuyAxe / BuyFireAxe (precisa do
+        Cash; se faltar, o jogo avisa "SEM_DINHEIRO").
+      * AUTO FARM completo: teleporta (remote do jogo) ate FARM1/2/3,
+        equipa machado REAL, anda ate a arvore mais proxima, corta ate
+        cair, coleta os troncos do chao (touch), teleporta pro SELL e
+        vende (SellAll). Loop infinito.
+      * HITKILL: cola o Handle do machado na arvore antes de cada golpe.
+        Funciona SE o Script do machado medir distancia Handle<->arvore
+        (testa e me fala). Se medir do personagem, o farm ja anda junto.
+      * AUTO VENDER a cada N segundos.
+      * AUTO BAU: anda por todos os baus do mapa.
+      * TELEPORTE via remote (FARM1/2/3, SELL) — aparentemente sem
+        validacao server-side.
+      * SPEED via remote UpdateWalkspeed + WalkSpeed direto.
 
     Uso:
       loadstring(game:HttpGet("https://raw.githubusercontent.com/rodrigsapps/KoalaUI/main/KoalaCortarVender.lua"))()
-
-    Standalone: cria uma mini GUI propria. Dentro do hub (futuro):
-    retorna funcao(Koala, Window, Flags) que cria a aba.
 ]]
 
 local Players           = game:GetService("Players")
@@ -40,21 +41,23 @@ local RunService        = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 --==================================================================--
---  REMOTES / REFS DO JOGO (do dump)
+--  REMOTES / REFS (do dump do KoalaSpy)
 --==================================================================--
 local R = {
     Teleport    = ReplicatedStorage:WaitForChild("RemoteEvents"):WaitForChild("Teleport"),
     SellAll     = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SellAll"),
     SellTool    = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SellTool"),
-    BuyAxe      = ReplicatedStorage:WaitForChild("BuyAxe"),
-    BuyFireAxe  = ReplicatedStorage:WaitForChild("BuyFireAxe"),
+    BuyAxe      = ReplicatedStorage:WaitForChild("BuyAxe"),      -- machado de gelo (450$)
+    BuyFireAxe  = ReplicatedStorage:WaitForChild("BuyFireAxe"),  -- machado de fogo (850$)
     UpdateWS    = ReplicatedStorage:WaitForChild("UpdateWalkspeed"),
     DropTool    = ReplicatedStorage:WaitForChild("DropTool"),
 }
-local PASTA_MACHADOS = ReplicatedStorage:WaitForChild("MachadosCorta")
 
-local NOMES_MACHADOS = { "machado", "machado de gelo", "machado de fogo", "machado angelical", "machado demon" }
-local NOMES_TRONCOS  = { "TRONCO", "TRONCO DE OURO", "TRONCO DE DIAMANTE" }
+-- nomes REAIS das Tools que o jogo da ao comprar (descobertos no dump)
+local MACHADO_BASE  = "machado"          -- StarterPack
+local MACHADO_GELO  = "machado de gelo"  -- via BuyAxe
+local MACHADO_FOGO  = "machado de fogo"  -- via BuyFireAxe
+local ORDEM_MACHADOS = { MACHADO_FOGO, MACHADO_GELO, MACHADO_BASE } -- prioridade
 
 --==================================================================--
 --  HELPERS
@@ -77,18 +80,23 @@ local function hum()
     return c and c:FindFirstChildOfClass("Humanoid")
 end
 
+local function cash()
+    local ok, v = pcall(function()
+        return LP:WaitForChild("leaderstats"):WaitForChild("Cash").Value
+    end)
+    return ok and v or 0
+end
+
 local function andarAte(pos, timeout)
     local h, r = hum(), hrp()
     if not h or not r then return false end
     h:MoveTo(pos)
     local t0 = os.clock()
-    local alvo = Vector3.new(pos.X, r.Position.Y, pos.Z)
     while os.clock() - t0 < (timeout or 20) do
         local p = hrp()
         if not p then return false end
-        local atual = Vector3.new(p.Position.X, 0, p.Position.Z)
-        local dest  = Vector3.new(pos.X, 0, pos.Z)
-        if (atual - dest).Magnitude < 6 then return true end
+        local d2d = Vector3.new(p.Position.X, 0, p.Position.Z) - Vector3.new(pos.X, 0, pos.Z)
+        if d2d.Magnitude < 6 then return true end
         task.wait(0.2)
     end
     return false
@@ -98,28 +106,25 @@ local function tpRemote(pos)
     pcall(function() R.Teleport:FireServer(pos) end)
 end
 
-local function tpDireto(pos)
-    local r = hrp()
-    if r then r.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0)) end
+local function posDe(nomePart)
+    local p = Workspace:FindFirstChild(nomePart)
+    return p and p.Position or nil
 end
 
 --==================================================================--
---  MACHADOS / TRONCOS (clone do ReplicatedStorage -> Backpack)
+--  MACHADOS — compra REAL via remote do jogo
 --==================================================================--
-local function darItem(nome, origem)
+local function temMachado(nome)
     local backpack = LP:FindFirstChildOfClass("Backpack")
-    if not backpack then return false, "sem Backpack" end
-    local jaTem = backpack:FindFirstChild(nome) or (char() and char():FindFirstChild(nome))
-    if jaTem then return false, "voce ja tem " .. nome end
+    return (backpack and backpack:FindFirstChild(nome))
+        or (char() and char():FindFirstChild(nome))
+end
 
-    local fonte = (origem and origem:FindFirstChild(nome))
-        or PASTA_MACHADOS:FindFirstChild(nome)
-        or ReplicatedStorage:FindFirstChild(nome)
-    if not fonte then return false, nome .. " nao existe no ReplicatedStorage" end
-
-    local clone = fonte:Clone()
-    clone.Parent = backpack
-    return true
+local function melhorMachado()
+    for _, nome in ipairs(ORDEM_MACHADOS) do
+        if temMachado(nome) then return nome end
+    end
+    return nil
 end
 
 local function equipar(nome)
@@ -128,87 +133,35 @@ local function equipar(nome)
     local tool = (char() and char():FindFirstChild(nome)) or (backpack and backpack:FindFirstChild(nome))
     if h and tool and tool:IsA("Tool") and tool.Parent ~= char() then
         h:EquipTool(tool)
+        task.wait(0.2)
     end
     return tool ~= nil
 end
 
---==================================================================--
---  HITKILL — aproxima o Handle da arvore a cada golpe
---  O dano e contado por Script SERVER-SIDE dentro da Tool/arvore
---  (nao ha remote de dano pra forjar). Se esse Script medir distancia
---  Handle<->arvore, mover o Handle pra dentro da arvore antes do
---  Activate faz contar TODOS os golpes instantaneamente. Se o server
---  usar distancia do PERSONAGEM, so funciona perto da arvore.
---==================================================================--
-local Hitkill = { ativo = false }
-
-RunService.Heartbeat:Connect(function()
-    if not Hitkill.ativo then return end
-    local c = char()
-    local tool = c and c:FindFirstChildWhichIsA("Tool")
-    if not tool then return end
-    local nome = tool.Name:lower()
-    if not nome:match("machado") then return end -- so em machados
-
-    local handle = tool:FindFirstChild("Handle")
-    local alvo = Hitkill.alvoAtual
-    if handle and alvo and alvo.Parent then
-        -- cola o Handle no centro da arvore (com pequeno jitter pra parecer natural)
-        local jitter = Vector3.new(math.random(-5,5)/10, math.random(0,10)/10, math.random(-5,5)/10)
-        handle.CFrame = CFrame.new(alvo.Position + jitter)
-    end
-end)
-
---==================================================================--
---  AUTO COLETAR — troncos sao Tools no Workspace; entram no Backpack
---  por TOUCH no Handle. Teleportamos o personagem em cima de cada um.
---  Guarda posicao pra voltar depois (quando nao estiver no Auto Farm).
---==================================================================--
-local Coletar = { ativo = false, raio = 300 }
-
-local function coletarTroncos()
-    local r = hrp()
-    if not r then return 0 end
-    local n = 0
-    for _, d in ipairs(Workspace:GetDescendants()) do
-        if d:IsA("Tool") and d.Name:match("^TRONCO") then
-            local handle = d:FindFirstChild("Handle") or d:FindFirstChildWhichIsA("BasePart", true)
-            if handle then
-                local dist = (handle.Position - r.Position).Magnitude
-                if dist <= Coletar.raio then
-                    -- gruda o personagem no tronco por 0.15s -> touch coleta
-                    local cf0 = r.CFrame
-                    r.CFrame = CFrame.new(handle.Position + Vector3.new(0, 1, 0))
-                    task.wait(0.15)
-                    if hrp() then hrp().CFrame = cf0 end
-                    n = n + 1
-                end
-            end
-        end
-    end
-    return n
+local function comprarGelo()
+    if temMachado(MACHADO_GELO) then return true, "voce ja tem" end
+    if cash() < 450 then return false, "precisa de 450$ (voce tem " .. cash() .. "$)" end
+    R.BuyAxe:FireServer()
+    task.wait(1)
+    return temMachado(MACHADO_GELO), temMachado(MACHADO_GELO) and "comprado!" or "servidor nao deu (sem cash?)"
 end
 
-task.spawn(function()
-    while true do
-        task.wait(0.8)
-        if Coletar.ativo and not State.autoFarm then
-            pcall(coletarTroncos)
-        end
-        -- no Auto Farm a coleta ja acontece dentro do loop principal
-    end
-end)
+local function comprarFogo()
+    if temMachado(MACHADO_FOGO) then return true, "voce ja tem" end
+    if cash() < 850 then return false, "precisa de 850$ (voce tem " .. cash() .. "$)" end
+    R.BuyFireAxe:FireServer()
+    task.wait(1)
+    return temMachado(MACHADO_FOGO), temMachado(MACHADO_FOGO) and "comprado!" or "servidor nao deu (sem cash?)"
+end
 
 --==================================================================--
---  ARVORES / BAUS — varredura dinamica
+--  ARVORES / BAUS
 --==================================================================--
 local function acharArvores()
-    -- o jogo tem ~3 mil instancias chamadas "Tree" espalhadas no Workspace
     local out = {}
     for _, d in ipairs(Workspace:GetDescendants()) do
         if d.Name == "Tree" then
-            local p = d:IsA("BasePart") and d
-                or d:FindFirstChildWhichIsA("BasePart", true)
+            local p = d:IsA("BasePart") and d or d:FindFirstChildWhichIsA("BasePart", true)
             if p then table.insert(out, p) end
         end
     end
@@ -238,11 +191,69 @@ local function acharBaus()
 end
 
 --==================================================================--
+--  HITKILL — cola o Handle na arvore antes de cada golpe
+--  Funciona SE o Script do machado medir distancia Handle<->arvore.
+--==================================================================--
+local Hitkill = { ativo = false, alvoAtual = nil }
+
+RunService.Heartbeat:Connect(function()
+    if not Hitkill.ativo then return end
+    local c = char()
+    local tool = c and c:FindFirstChildWhichIsA("Tool")
+    if not tool or not tool.Name:lower():match("machado") then return end
+    local handle = tool:FindFirstChild("Handle")
+    local alvo = Hitkill.alvoAtual
+    if handle and alvo and alvo.Parent then
+        handle.CFrame = CFrame.new(alvo.Position + Vector3.new(
+            math.random(-5,5)/10, math.random(0,10)/10, math.random(-5,5)/10))
+    end
+end)
+
+--==================================================================--
+--  COLETAR TRONCOS — Tools no Workspace entram no Backpack por touch
+--==================================================================--
+local Coletar = { ativo = true, raio = 300 }
+
+local function coletarTroncos()
+    local r = hrp()
+    if not r then return 0 end
+    local n = 0
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("Tool") and d.Name:match("^TRONCO") then
+            local handle = d:FindFirstChild("Handle") or d:FindFirstChildWhichIsA("BasePart", true)
+            if handle and (handle.Position - r.Position).Magnitude <= Coletar.raio then
+                local cf0 = r.CFrame
+                r.CFrame = CFrame.new(handle.Position + Vector3.new(0, 1, 0))
+                task.wait(0.12)
+                local r2 = hrp()
+                if r2 then r2.CFrame = cf0 end
+                n = n + 1
+            end
+        end
+    end
+    return n
+end
+
+--==================================================================--
 --  VENDER
 --==================================================================--
 local function venderTudo()
-    local ok, res = pcall(function() return R.SellAll:InvokeServer() end)
-    return ok, res
+    local ok = pcall(function() R.SellAll:InvokeServer() end)
+    return ok
+end
+
+local function contarTroncos()
+    local n = 0
+    local backpack = LP:FindFirstChildOfClass("Backpack")
+    local containers = { backpack, char() }
+    for _, cont in ipairs(containers) do
+        if cont then
+            for _, t in ipairs(cont:GetChildren()) do
+                if t:IsA("Tool") and t.Name:match("^TRONCO") then n = n + 1 end
+            end
+        end
+    end
+    return n
 end
 
 --==================================================================--
@@ -252,95 +263,70 @@ local State = {
     autoFarm   = false,
     autoVender = false,
     autoBau    = false,
-    venderACada = 15,   -- segundos (auto vender)
-    speed      = 16,
+    venderACada = 20,
 }
 
 task.spawn(function() -- AUTO VENDER
     while true do
         task.wait(State.venderACada)
-        if State.autoVender then
+        if State.autoVender and not State.autoFarm then
             venderTudo()
         end
     end
 end)
 
-task.spawn(function() -- AUTO FARM
+task.spawn(function() -- AUTO FARM (loop principal)
     while true do
-        task.wait(0.3)
+        task.wait(0.5)
         if State.autoFarm then
             pcall(function()
-                -- 1) garante um machado equipado
-                local backpack = LP:FindFirstChildOfClass("Backpack")
-                local temMachado = false
-                for _, nome in ipairs(NOMES_MACHADOS) do
-                    if (char() and char():FindFirstChild(nome)) or (backpack and backpack:FindFirstChild(nome)) then
-                        temMachado = equipar(nome)
-                        break
+                -- 1) garante machado real (compra gelo se nao tiver nenhum)
+                local machado = melhorMachado()
+                if not machado then
+                    local ok, msg = comprarGelo()
+                    if not ok then
+                        notify("Auto Farm", "Sem machado! " .. tostring(msg), 4)
+                        State.autoFarm = false
+                        return
                     end
+                    machado = melhorMachado()
                 end
-                if not temMachado then
-                    darItem("machado")
-                    equipar("machado")
+                equipar(machado)
+
+                -- 2) teleporta pro FARM se estiver longe das arvores
+                local alvo = arvoreMaisProxima()
+                local r = hrp()
+                if alvo and r and (alvo.Position - r.Position).Magnitude > 400 then
+                    local f = posDe("FARM1")
+                    if f then tpRemote(f) task.wait(1.5) end
+                    alvo = arvoreMaisProxima()
                 end
 
-                -- 2) vai ate a arvore mais proxima e corta (com hitkill se ligado)
-                local alvo = arvoreMaisProxima()
+                -- 3) corta a arvore mais proxima ate cair
                 if alvo then
                     andarAte(alvo.Position, 25)
                     Hitkill.alvoAtual = alvo
-                    local tool = char() and char():FindFirstChildWhichIsA("Tool")
                     local t0 = os.clock()
-                    local alvoAnterior = alvo
-                    while State.autoFarm and os.clock() - t0 < 8 do
-                        if tool and tool.Parent == char() then
+                    while State.autoFarm and alvo.Parent and os.clock() - t0 < 10 do
+                        local tool = char() and char():FindFirstChildWhichIsA("Tool")
+                        if tool and tool.Name:lower():match("machado") then
                             tool:Activate()
                         end
-                        task.wait(0.15)
-                        -- coleta troncos que cairam (raio maior no farm)
-                        if Coletar.ativo then
-                            coletarTroncos()
-                        else
-                            for _, d in ipairs(Workspace:GetChildren()) do
-                                if d:IsA("Tool") and d.Name:match("^TRONCO") then
-                                    local handle = d:FindFirstChild("Handle")
-                                    local r = hrp()
-                                    if handle and r and (handle.Position - r.Position).Magnitude < 60 then
-                                        andarAte(handle.Position, 8)
-                                    end
-                                end
-                            end
-                        end
-                        -- se a arvore sumiu (morreu), troca de alvo
-                        if not alvoAnterior.Parent then
-                            alvo = arvoreMaisProxima()
-                            if alvo then
-                                Hitkill.alvoAtual = alvo
-                                alvoAnterior = alvo
-                            end
-                        end
+                        task.wait(0.2)
+                        if Coletar.ativo then coletarTroncos() end
                     end
                     Hitkill.alvoAtual = nil
                 end
 
-                -- 3) mochila cheia? vende
-                local backpack2 = LP:FindFirstChildOfClass("Backpack")
-                if backpack2 then
-                    local troncos = 0
-                    for _, t in ipairs(backpack2:GetChildren()) do
-                        if t.Name:match("^TRONCO") then troncos = troncos + 1 end
+                -- 4) vende quando juntar troncos suficientes
+                if contarTroncos() >= 6 then
+                    local s = posDe("SELL")
+                    if s then
+                        tpRemote(s)
+                        task.wait(1.5)
                     end
-                    if char() then
-                        for _, t in ipairs(char():GetChildren()) do
-                            if t:IsA("Tool") and t.Name:match("^TRONCO") then troncos = troncos + 1 end
-                        end
-                    end
-                    if troncos >= 8 then
-                        local sell = Workspace:FindFirstChild("SELL")
-                        if sell then tpRemote(sell.Position) task.wait(1.5) end
-                        venderTudo()
-                        task.wait(1)
-                    end
+                    venderTudo()
+                    task.wait(1)
                 end
             end)
         end
@@ -357,7 +343,7 @@ task.spawn(function() -- AUTO BAU
                     local p = bau:FindFirstChildWhichIsA("BasePart", true)
                     if p then
                         andarAte(p.Position, 30)
-                        task.wait(1.5) -- deixa o prompt do bau disparar
+                        task.wait(1.5)
                     end
                 end
             end)
@@ -366,7 +352,7 @@ task.spawn(function() -- AUTO BAU
 end)
 
 --==================================================================--
---  GUI PROPRIA (standalone) — simples, sobrevive a respawn
+--  GUI (standalone)
 --==================================================================--
 local function criarGui()
     local pg = LP:WaitForChild("PlayerGui")
@@ -378,8 +364,8 @@ local function criarGui()
     gui.Parent = pg
 
     local main = Instance.new("Frame")
-    main.Size = UDim2.new(0, 240, 0, 380)
-    main.Position = UDim2.new(0, 20, 0.5, -190)
+    main.Size = UDim2.new(0, 250, 0, 100)
+    main.Position = UDim2.new(0, 20, 0.5, -200)
     main.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
     main.BorderSizePixel = 0
     main.Active = true
@@ -388,19 +374,28 @@ local function criarGui()
     Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
 
     local titulo = Instance.new("TextLabel")
-    titulo.Size = UDim2.new(1, 0, 0, 32)
+    titulo.Size = UDim2.new(1, 0, 0, 30)
     titulo.BackgroundTransparency = 1
-    titulo.Text = "Koala — Cortar e Vender"
+    titulo.Text = "Koala — Cortar e Vender  |  Cash: 0"
     titulo.TextColor3 = Color3.fromRGB(255, 255, 255)
     titulo.Font = Enum.Font.GothamBlack
-    titulo.TextSize = 14
+    titulo.TextSize = 13
     titulo.Parent = main
+
+    task.spawn(function() -- atualiza o cash no titulo
+        while gui.Parent do
+            pcall(function()
+                titulo.Text = string.format("Koala — Cortar e Vender  |  Cash: %d", cash())
+            end)
+            task.wait(2)
+        end
+    end)
 
     local lista = Instance.new("UIListLayout")
     lista.Padding = UDim.new(0, 5)
     lista.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    lista.Parent = main
     lista.SortOrder = Enum.SortOrder.LayoutOrder
+    lista.Parent = main
 
     local pad = Instance.new("UIPadding", main)
     pad.PaddingTop = UDim.new(0, 34)
@@ -414,119 +409,91 @@ local function criarGui()
         b.Font = Enum.Font.GothamBold
         b.TextSize = 13
         b.Text = texto
-        b.AutoButtonColor = true
         b.Parent = main
         Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
         b.MouseButton1Click:Connect(function() callback(b) end)
         y = y + 1
+        main.Size = UDim2.new(0, 250, 0, 44 + (y * 35))
         return b
     end
 
-    local function toggle(texto, chave)
+    local function toggleBtn(texto, get, set)
         return botao(texto .. ": OFF", function(b)
-            State[chave] = not State[chave]
-            b.Text = texto .. (State[chave] and ": ON" or ": OFF")
-            b.BackgroundColor3 = State[chave] and Color3.fromRGB(35, 120, 70) or Color3.fromRGB(45, 48, 55)
+            local novo = not get()
+            set(novo)
+            b.Text = texto .. (novo and ": ON" or ": OFF")
+            b.BackgroundColor3 = novo and Color3.fromRGB(35, 120, 70) or Color3.fromRGB(45, 48, 55)
         end)
     end
 
-    toggle("Auto Farm", "autoFarm")
-    toggle("Auto Vender", "autoVender")
-    toggle("Auto Bau", "autoBau")
+    -- toggles principais
+    toggleBtn("Auto Farm", function() return State.autoFarm end, function(v) State.autoFarm = v end)
+    toggleBtn("Hitkill arvore", function() return Hitkill.ativo end, function(v) Hitkill.ativo = v end)
+    toggleBtn("Auto coletar", function() return Coletar.ativo end, function(v) Coletar.ativo = v end)
+    toggleBtn("Auto Vender", function() return State.autoVender end, function(v) State.autoVender = v end)
+    toggleBtn("Auto Bau", function() return State.autoBau end, function(v) State.autoBau = v end)
 
-    -- hitkill / coleta (estados fora da tabela State)
-    botao("Hitkill arvore: OFF", function(b)
-        Hitkill.ativo = not Hitkill.ativo
-        b.Text = "Hitkill arvore: " .. (Hitkill.ativo and "ON" or "OFF")
-        b.BackgroundColor3 = Hitkill.ativo and Color3.fromRGB(35, 120, 70) or Color3.fromRGB(45, 48, 55)
-        notify("Hitkill", Hitkill.ativo and "Ativado — va ate uma arvore e corte." or "Desativado.", 3)
+    -- compras reais
+    botao("Comprar machado de gelo (450$)", function()
+        local ok, msg = comprarGelo()
+        notify("Loja", tostring(msg), 3)
+    end)
+    botao("Comprar machado de fogo (850$)", function()
+        local ok, msg = comprarFogo()
+        notify("Loja", tostring(msg), 3)
     end)
 
-    botao("Auto coletar troncos: OFF", function(b)
-        Coletar.ativo = not Coletar.ativo
-        b.Text = "Auto coletar troncos: " .. (Coletar.ativo and "ON" or "OFF")
-        b.BackgroundColor3 = Coletar.ativo and Color3.fromRGB(35, 120, 70) or Color3.fromRGB(45, 48, 55)
-    end)
-
+    -- acoes
     botao("Vender tudo agora", function()
         local ok = venderTudo()
-        notify("Vender", ok and "Inventario vendido!" or "Falha ao vender.", 2)
+        notify("Vender", ok and "Vendido!" or "Falha (sem troncos?)", 2)
     end)
-
-    botao("TP: zona FARM (remote)", function()
-        local f = Workspace:FindFirstChild("FARM1")
-        if f then tpRemote(f.Position) end
+    botao("TP: FARM1", function() local p = posDe("FARM1") if p then tpRemote(p) end end)
+    botao("TP: FARM2", function() local p = posDe("FARM2") if p then tpRemote(p) end end)
+    botao("TP: FARM3", function() local p = posDe("FARM3") if p then tpRemote(p) end end)
+    botao("TP: SELL + vender", function()
+        local p = posDe("SELL")
+        if p then tpRemote(p) task.wait(1.5) venderTudo() end
     end)
-
-    botao("TP: vendedor SELL (remote)", function()
-        local s = Workspace:FindFirstChild("SELL")
-        if s then tpRemote(s.Position) task.wait(1) venderTudo() end
-    end)
-
-    -- machados
-    for _, nome in ipairs(NOMES_MACHADOS) do
-        botao("Pegar: " .. nome, function()
-            local ok, err = darItem(nome)
-            notify("Machado", ok and (nome .. " no Backpack!") or tostring(err), 3)
-        end)
-    end
-
-    -- troncos
-    for _, nome in ipairs(NOMES_TRONCOS) do
-        botao("Spawnar: " .. nome, function()
-            local ok, err = darItem(nome, ReplicatedStorage)
-            notify("Tronco", ok and (nome .. " no Backpack!") or tostring(err), 2)
-        end)
-    end
-
-    botao("Speed 50 (remote do jogo)", function()
+    botao("Speed 50", function()
         pcall(function() R.UpdateWS:FireServer(50) end)
         local h = hum()
         if h then h.WalkSpeed = 50 end
     end)
 
-    main.Size = UDim2.new(0, 240, 0, 44 + (y * 35))
     return gui
 end
 
 --==================================================================--
---  BOOT standalone
+--  BOOT
 --==================================================================--
 if not _G.KoalaCVBooted then
     _G.KoalaCVBooted = true
     task.spawn(function()
         task.wait(1.5)
         criarGui()
-        notify("Koala C&V", "Carregado! GUI na lateral esquerda.", 4)
+        notify("Koala C&V", "Carregado! Compre um machado real (botao na GUI) e ligue o Auto Farm.", 5)
     end)
 end
 
 --==================================================================--
---  RETORNO: integracao com o hub (futuro)
+--  RETORNO: integracao futura com o hub
 --==================================================================--
 return function(Koala, Window, Flags)
-    -- quando integrado ao KoalaHub, expoe as mesmas acoes numa aba
     if not Window then return end
     pcall(function()
         local tab = Window:Tab({ Title = "Cortar&Vender", Icon = "axe" })
         tab:Toggle({ Title = "Auto Farm", Value = State.autoFarm, Callback = function(v) State.autoFarm = v end })
-        tab:Toggle({ Title = "Auto Vender (a cada " .. State.venderACada .. "s)", Value = State.autoVender, Callback = function(v) State.autoVender = v end })
-        tab:Toggle({ Title = "Auto Bau", Value = State.autoBau, Callback = function(v) State.autoBau = v end })
         tab:Toggle({ Title = "Hitkill arvore", Value = Hitkill.ativo, Callback = function(v) Hitkill.ativo = v end })
-        tab:Toggle({ Title = "Auto coletar troncos", Value = Coletar.ativo, Callback = function(v) Coletar.ativo = v end })
+        tab:Toggle({ Title = "Auto coletar", Value = Coletar.ativo, Callback = function(v) Coletar.ativo = v end })
+        tab:Toggle({ Title = "Auto Vender", Value = State.autoVender, Callback = function(v) State.autoVender = v end })
+        tab:Toggle({ Title = "Auto Bau", Value = State.autoBau, Callback = function(v) State.autoBau = v end })
+        tab:Button({ Title = "Comprar machado de gelo (450$)", Callback = comprarGelo })
+        tab:Button({ Title = "Comprar machado de fogo (850$)", Callback = comprarFogo })
         tab:Button({ Title = "Vender tudo agora", Callback = venderTudo })
-        for _, nome in ipairs(NOMES_MACHADOS) do
-            tab:Button({ Title = "Pegar: " .. nome, Callback = function() darItem(nome) end })
-        end
-        for _, nome in ipairs(NOMES_TRONCOS) do
-            tab:Button({ Title = "Spawnar: " .. nome, Callback = function() darItem(nome, ReplicatedStorage) end })
-        end
-        tab:Button({
-            Title = "TP: vendedor (remote) + vender",
-            Callback = function()
-                local s = Workspace:FindFirstChild("SELL")
-                if s then tpRemote(s.Position) task.wait(1) venderTudo() end
-            end,
-        })
+        tab:Button({ Title = "TP: SELL + vender", Callback = function()
+            local p = posDe("SELL")
+            if p then tpRemote(p) task.wait(1.5) venderTudo() end
+        end })
     end)
 end
