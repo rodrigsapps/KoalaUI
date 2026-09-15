@@ -133,6 +133,73 @@ local function equipar(nome)
 end
 
 --==================================================================--
+--  HITKILL — aproxima o Handle da arvore a cada golpe
+--  O dano e contado por Script SERVER-SIDE dentro da Tool/arvore
+--  (nao ha remote de dano pra forjar). Se esse Script medir distancia
+--  Handle<->arvore, mover o Handle pra dentro da arvore antes do
+--  Activate faz contar TODOS os golpes instantaneamente. Se o server
+--  usar distancia do PERSONAGEM, so funciona perto da arvore.
+--==================================================================--
+local Hitkill = { ativo = false }
+
+RunService.Heartbeat:Connect(function()
+    if not Hitkill.ativo then return end
+    local c = char()
+    local tool = c and c:FindFirstChildWhichIsA("Tool")
+    if not tool then return end
+    local nome = tool.Name:lower()
+    if not nome:match("machado") then return end -- so em machados
+
+    local handle = tool:FindFirstChild("Handle")
+    local alvo = Hitkill.alvoAtual
+    if handle and alvo and alvo.Parent then
+        -- cola o Handle no centro da arvore (com pequeno jitter pra parecer natural)
+        local jitter = Vector3.new(math.random(-5,5)/10, math.random(0,10)/10, math.random(-5,5)/10)
+        handle.CFrame = CFrame.new(alvo.Position + jitter)
+    end
+end)
+
+--==================================================================--
+--  AUTO COLETAR — troncos sao Tools no Workspace; entram no Backpack
+--  por TOUCH no Handle. Teleportamos o personagem em cima de cada um.
+--  Guarda posicao pra voltar depois (quando nao estiver no Auto Farm).
+--==================================================================--
+local Coletar = { ativo = false, raio = 300 }
+
+local function coletarTroncos()
+    local r = hrp()
+    if not r then return 0 end
+    local n = 0
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("Tool") and d.Name:match("^TRONCO") then
+            local handle = d:FindFirstChild("Handle") or d:FindFirstChildWhichIsA("BasePart", true)
+            if handle then
+                local dist = (handle.Position - r.Position).Magnitude
+                if dist <= Coletar.raio then
+                    -- gruda o personagem no tronco por 0.15s -> touch coleta
+                    local cf0 = r.CFrame
+                    r.CFrame = CFrame.new(handle.Position + Vector3.new(0, 1, 0))
+                    task.wait(0.15)
+                    if hrp() then hrp().CFrame = cf0 end
+                    n = n + 1
+                end
+            end
+        end
+    end
+    return n
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.8)
+        if Coletar.ativo and not State.autoFarm then
+            pcall(coletarTroncos)
+        end
+        -- no Auto Farm a coleta ja acontece dentro do loop principal
+    end
+end)
+
+--==================================================================--
 --  ARVORES / BAUS — varredura dinamica
 --==================================================================--
 local function acharArvores()
@@ -217,28 +284,43 @@ task.spawn(function() -- AUTO FARM
                     equipar("machado")
                 end
 
-                -- 2) vai ate a arvore mais proxima e corta
+                -- 2) vai ate a arvore mais proxima e corta (com hitkill se ligado)
                 local alvo = arvoreMaisProxima()
                 if alvo then
                     andarAte(alvo.Position, 25)
+                    Hitkill.alvoAtual = alvo
                     local tool = char() and char():FindFirstChildWhichIsA("Tool")
                     local t0 = os.clock()
-                    while State.autoFarm and os.clock() - t0 < 6 do
+                    local alvoAnterior = alvo
+                    while State.autoFarm and os.clock() - t0 < 8 do
                         if tool and tool.Parent == char() then
                             tool:Activate()
                         end
-                        task.wait(0.4)
-                        -- se apareceu tronco no chao perto, coleta
-                        for _, d in ipairs(Workspace:GetChildren()) do
-                            if d:IsA("Tool") and d.Name:match("^TRONCO") then
-                                local handle = d:FindFirstChild("Handle")
-                                local r = hrp()
-                                if handle and r and (handle.Position - r.Position).Magnitude < 60 then
-                                    andarAte(handle.Position, 8)
+                        task.wait(0.15)
+                        -- coleta troncos que cairam (raio maior no farm)
+                        if Coletar.ativo then
+                            coletarTroncos()
+                        else
+                            for _, d in ipairs(Workspace:GetChildren()) do
+                                if d:IsA("Tool") and d.Name:match("^TRONCO") then
+                                    local handle = d:FindFirstChild("Handle")
+                                    local r = hrp()
+                                    if handle and r and (handle.Position - r.Position).Magnitude < 60 then
+                                        andarAte(handle.Position, 8)
+                                    end
                                 end
                             end
                         end
+                        -- se a arvore sumiu (morreu), troca de alvo
+                        if not alvoAnterior.Parent then
+                            alvo = arvoreMaisProxima()
+                            if alvo then
+                                Hitkill.alvoAtual = alvo
+                                alvoAnterior = alvo
+                            end
+                        end
                     end
+                    Hitkill.alvoAtual = nil
                 end
 
                 -- 3) mochila cheia? vende
@@ -352,6 +434,20 @@ local function criarGui()
     toggle("Auto Vender", "autoVender")
     toggle("Auto Bau", "autoBau")
 
+    -- hitkill / coleta (estados fora da tabela State)
+    botao("Hitkill arvore: OFF", function(b)
+        Hitkill.ativo = not Hitkill.ativo
+        b.Text = "Hitkill arvore: " .. (Hitkill.ativo and "ON" or "OFF")
+        b.BackgroundColor3 = Hitkill.ativo and Color3.fromRGB(35, 120, 70) or Color3.fromRGB(45, 48, 55)
+        notify("Hitkill", Hitkill.ativo and "Ativado — va ate uma arvore e corte." or "Desativado.", 3)
+    end)
+
+    botao("Auto coletar troncos: OFF", function(b)
+        Coletar.ativo = not Coletar.ativo
+        b.Text = "Auto coletar troncos: " .. (Coletar.ativo and "ON" or "OFF")
+        b.BackgroundColor3 = Coletar.ativo and Color3.fromRGB(35, 120, 70) or Color3.fromRGB(45, 48, 55)
+    end)
+
     botao("Vender tudo agora", function()
         local ok = venderTudo()
         notify("Vender", ok and "Inventario vendido!" or "Falha ao vender.", 2)
@@ -416,6 +512,8 @@ return function(Koala, Window, Flags)
         tab:Toggle({ Title = "Auto Farm", Value = State.autoFarm, Callback = function(v) State.autoFarm = v end })
         tab:Toggle({ Title = "Auto Vender (a cada " .. State.venderACada .. "s)", Value = State.autoVender, Callback = function(v) State.autoVender = v end })
         tab:Toggle({ Title = "Auto Bau", Value = State.autoBau, Callback = function(v) State.autoBau = v end })
+        tab:Toggle({ Title = "Hitkill arvore", Value = Hitkill.ativo, Callback = function(v) Hitkill.ativo = v end })
+        tab:Toggle({ Title = "Auto coletar troncos", Value = Coletar.ativo, Callback = function(v) Coletar.ativo = v end })
         tab:Button({ Title = "Vender tudo agora", Callback = venderTudo })
         for _, nome in ipairs(NOMES_MACHADOS) do
             tab:Button({ Title = "Pegar: " .. nome, Callback = function() darItem(nome) end })
