@@ -32,7 +32,7 @@
 --==================================================================--
 --  CONFIG
 --==================================================================--
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1546164688994177112/FVxL0qlwRYpI6ITaoTbK0qqchk2cxCrxB_r_5DDDV_HGEAzmYB5lDBwCyqtLI2GYiZ52"
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1549385323044151296/7T_ZOMoz2BOd5RdiZo4peuYEsXxIhbReVP9_gKIIR_nIw6yOvBfAxBOppnldMP3AHJng"
 local INTERVALO_FILA = 5
 local MAX_MSG        = 1800
 local MAX_FILA       = 400
