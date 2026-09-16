@@ -1,30 +1,21 @@
 --[[
-    KOALA HUB — LEVANTE UM CUBO (Lift a Cube) — PlaceId 109530157755211
-    -------------------------------------------------------------------
-    v2 — mais rapido, mais sistemas.
+    KOALA HUB — LEVANTE UM CUBO — PlaceId 109530157755211
+    -----------------------------------------------------
+    v3 — feito pra FUNCIONAR e ser facil de entender.
 
-    Novidades v2:
-      * AUTO LIFT TURBO: intervalo configuravel (ate 0.05s) + rajada
-        (varios ciclos abrir/concluir por tick). Muito mais rapido que v1.
-      * AUTO POPS 2.0: agora pega pelo HOOK da bridge — no instante em
-        que o servidor spawna o pop, a coleta volta pelo remote. Nao
-        depende mais de clicar em botao na tela. (varredura de UI fica
-        como fallback.)
-      * ATRAVESSAR BARREIRAS: desliga a colisao dos portoes de Strength
-        (World.Client.Barries) — entra nas zonas sem ter forca.
-      * PROMPTS INSTANTANEOS: HoldDuration = 0 em todos os
-        ProximityPrompts (bau abre sem segurar).
-      * LISTA DE CUBOS AUTO-ATUALIZADA: quando o jogo da refresh nos
-        cubos, o dropdown se refaz sozinho. Modo "Auto" pega sempre o
-        menor cubo disponivel.
-      * STATUS AO VIVO: Strength e Cash atualizando a cada segundo.
-      * WalkSpeed TRAVADO (o jogo nao reseta mais).
+    O que mudou:
+      * TESTE AUTOMATICO ao abrir: o script dispara 1 levantamento de
+        teste e ve se sua forca subiu. Se os remotes nao funcionarem no
+        seu executor, ele te avisa e liga o MODO SEGURO.
+      * MODO SEGURO: usa os botoes do proprio jogo (prompt + clique
+        automatico). E mais lento, mas o servidor nao tem como ignorar.
+      * Textos da UI curtos e diretos, em portugues.
 
-    Formato dos remotes (do dump, BridgeNet2):
-      bridge = "<UserId>_<Controller>", pacote = { Function, Args }
-      Cubes: abrir {Args={idx}} | concluir {Function="FinishLift", Args={idx}}
-      Training: {Args={reps}} | Pops: claim {Args={id}}
-      AFK: {Args={}} a cada 30s
+    Abas:
+      Farm      = levantar cubos e treinar sem parar
+      Coletar   = baloes e baus automaticos
+      Movimento = velocidade, atravessar portoes
+      Status    = numeros ao vivo + o que esta funcionando
 
     Uso:
       loadstring(game:HttpGet("https://raw.githubusercontent.com/rodrigsapps/KoalaUI/main/KoalaCubo.lua"))()
@@ -34,19 +25,34 @@ local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace         = game:GetService("Workspace")
 local RunService        = game:GetService("RunService")
+local VIM               = game:GetService("VirtualInputManager")
 
 local LP = Players.LocalPlayer
 
 --==================================================================--
---  BRIDGENET2
+--  AVISOS
+--==================================================================--
+local function aviso(msg, dur)
+    print("[KoalaCubo] " .. tostring(msg))
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification",
+            { Title = "Koala Cubo", Text = tostring(msg), Duration = dur or 3 })
+    end)
+end
+
+--==================================================================--
+--  REMOTES (BridgeNet2 — mesmo formato que o jogo usa)
 --==================================================================--
 local BridgeNet = nil
+local REMOTES_OK = false
+
 pcall(function()
-    BridgeNet = require(ReplicatedStorage:WaitForChild("Packages"):WaitForChild("bridgenet2"))
+    BridgeNet = require(ReplicatedStorage:WaitForChild("Packages", 10):WaitForChild("bridgenet2", 10))
 end)
 
 local uid = tostring(LP.UserId):gsub("-", "")
 local bridges = {}
+local falhaLog = {}
 
 local function bridge(nome)
     if not BridgeNet then return nil end
@@ -54,10 +60,13 @@ local function bridge(nome)
         local ok, b = pcall(function()
             return BridgeNet.ReferenceBridge(uid .. "_" .. nome)
         end)
-        if ok then
+        if ok and b then
             bridges[nome] = b
         else
-            warn("[KoalaCubo] falha ao criar bridge: " .. nome)
+            if not falhaLog[nome] then
+                falhaLog[nome] = true
+                warn("[KoalaCubo] nao consegui abrir o canal: " .. nome)
+            end
             return nil
         end
     end
@@ -67,22 +76,19 @@ end
 local function fire(nome, fn, args)
     local b = bridge(nome)
     if not b then return false end
-    return pcall(function()
+    local ok = pcall(function()
         b:Fire({ ["Function"] = fn, ["Args"] = args or {} })
     end)
+    if not ok and not falhaLog[nome .. "_fire"] then
+        falhaLog[nome .. "_fire"] = true
+        warn("[KoalaCubo] falha ao enviar pacote: " .. nome)
+    end
+    return ok
 end
 
 --==================================================================--
---  HELPERS
+--  ATALHOS
 --==================================================================--
-local function notify(titulo, msg, dur)
-    print("[KoalaCubo] " .. tostring(msg))
-    pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification",
-            { Title = titulo or "Koala Cubo", Text = msg, Duration = dur or 3 })
-    end)
-end
-
 local function char() return LP.Character end
 local function hrp()
     local c = char()
@@ -95,31 +101,42 @@ end
 
 local function forca()
     local ok, v = pcall(function() return LP:GetAttribute("Strength") end)
-    return ok and v or 0
+    return (ok and tonumber(v)) or 0
 end
 
 local function dinheiro()
     local ok, v = pcall(function() return LP:GetAttribute("Cash") end)
-    return ok and v or 0
+    return (ok and tonumber(v)) or 0
 end
 
-local function andarAte(pos, timeout)
+local function andarAte(pos, limite)
     local h, r = hum(), hrp()
     if not h or not r then return false end
     h:MoveTo(pos)
     local t0 = os.clock()
-    while os.clock() - t0 < (timeout or 20) do
+    while os.clock() - t0 < (limite or 20) do
         local p = hrp()
         if not p then return false end
-        local d2d = Vector3.new(p.Position.X, 0, p.Position.Z) - Vector3.new(pos.X, 0, pos.Z)
-        if d2d.Magnitude < 7 then return true end
+        local d = Vector3.new(p.Position.X, 0, p.Position.Z) - Vector3.new(pos.X, 0, pos.Z)
+        if d.Magnitude < 7 then return true end
         task.wait(0.2)
     end
     return false
 end
 
+local function clicarTela()
+    pcall(function()
+        local cam = Workspace.CurrentCamera
+        local x = cam.ViewportSize.X / 2
+        local y = cam.ViewportSize.Y / 2
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.03)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+end
+
 --==================================================================--
---  CUBOS (workspace.World.Shared.Cubes, nome numerico = index)
+--  CUBOS DO MAPA
 --==================================================================--
 local function pastaCubos()
     local ok, f = pcall(function()
@@ -135,51 +152,54 @@ local function listarCubos()
         for _, c in ipairs(f:GetChildren()) do
             local idx = tonumber(c.Name)
             if idx and c:IsA("BasePart") then
-                table.insert(out, idx)
+                table.insert(out, { idx = idx, part = c })
             end
         end
     end
-    table.sort(out)
+    table.sort(out, function(a, b) return a.idx < b.idx end)
     return out
+end
+
+local function menorCubo()
+    local lista = listarCubos()
+    return #lista > 0 and lista[1] or nil
 end
 
 --==================================================================--
 --  ESTADO
 --==================================================================--
-local State = {
-    autoLift = false,
-    autoTrain = false,
-    autoPops = false,
-    autoBau = false,
+local S = {
+    lift = false,        -- levantar cubos
+    liftSeguro = false,  -- modo seguro (prompt + clique)
+    treino = false,      -- treinar (flexao)
+    baloes = false,      -- pegar baloes
+    baus = false,        -- abrir baus
+    portoes = false,     -- atravessar portoes
+    botoesRapidos = false, -- HoldDuration = 0
+    manterVel = false,
     antiAfk = true,
-    promptsInstant = false,
-    atravessar = false,
-    travarSpeed = false,
 }
 
-local cuboAlvo = 1          -- 0 = Auto (menor disponivel)
-local liftIntervalo = 0.1   -- s entre ciclos
-local liftRajada = 1        -- ciclos abrir+concluir por tick
-local trainReps = 1
-local trainIntervalo = 0.15
-local speedAlvo = 16
+local cuboAlvo = 0       -- 0 = automatico (mais fraco)
+local velLift = 0.15     -- s entre levantamentos
+local repsTreino = 1
+local velTreino = 0.2
+local velAndar = 16
 
 --==================================================================--
---  AUTO LIFT (turbo: intervalo + rajada configuraveis)
+--  LEVANTAR CUBOS — MODO RAPIDO (remote direto)
 --==================================================================--
 task.spawn(function()
     while true do
-        if State.autoLift then
+        if S.lift and not S.liftSeguro and REMOTES_OK then
             local idx = cuboAlvo
             if idx == 0 then
-                local lista = listarCubos()
-                idx = #lista > 0 and lista[1] or 1
+                local m = menorCubo()
+                idx = m and m.idx or 1
             end
-            for _ = 1, liftRajada do
-                fire("Cubes", nil, { idx })
-                fire("Cubes", "FinishLift", { idx })
-            end
-            task.wait(liftIntervalo)
+            fire("Cubes", nil, { idx })            -- comeca
+            fire("Cubes", "FinishLift", { idx })   -- conclui
+            task.wait(velLift)
         else
             task.wait(0.25)
         end
@@ -187,13 +207,42 @@ task.spawn(function()
 end)
 
 --==================================================================--
---  AUTO TRAIN
+--  LEVANTAR CUBOS — MODO SEGURO (prompt + clique de verdade)
 --==================================================================--
 task.spawn(function()
     while true do
-        if State.autoTrain then
-            fire("Training", nil, { trainReps })
-            task.wait(trainIntervalo)
+        if S.liftSeguro then
+            local alvo = nil
+            if cuboAlvo == 0 then
+                alvo = menorCubo()
+            else
+                local f = pastaCubos()
+                local p = f and f:FindFirstChild(tostring(cuboAlvo))
+                if p then alvo = { idx = cuboAlvo, part = p } end
+            end
+            if alvo then
+                local r = hrp()
+                if r then
+                    -- encosta no cubo
+                    r.CFrame = alvo.part.CFrame * CFrame.new(0, 0, 4)
+                    task.wait(0.3)
+                    -- aperta o botao do cubo
+                    local prompt = alvo.part:FindFirstChildOfClass("ProximityPrompt")
+                    if prompt then
+                        pcall(function() prompt.HoldDuration = 0 end)
+                        pcall(function() fireproximityprompt(prompt) end)
+                    end
+                    -- clica ate concluir (o proprio jogo conta o progresso)
+                    local t0 = os.clock()
+                    while S.liftSeguro and os.clock() - t0 < 8 do
+                        clicarTela()
+                        task.wait(0.08)
+                    end
+                end
+            else
+                task.wait(1)
+            end
+            task.wait(0.2)
         else
             task.wait(0.25)
         end
@@ -201,47 +250,59 @@ task.spawn(function()
 end)
 
 --==================================================================--
---  AUTO POPS v2 — hook da bridge (claim instantaneo via remote)
+--  TREINO (flexao)
 --==================================================================--
 task.spawn(function()
-    task.wait(3) -- deixa o jogo criar as bridges primeiro
-    local b = bridge("Pops")
-    if not b then return end
-    pcall(function()
-        b:Connect(function(pacote)
-            if not State.autoPops then return end
-            if type(pacote) == "table" and pacote.Function == "Spawn" then
-                local id = pacote.Args and pacote.Args[1]
-                if type(id) == "number" then
-                    fire("Pops", nil, { id })
-                end
-            end
-        end)
-    end)
+    while true do
+        if S.treino and REMOTES_OK then
+            fire("Training", nil, { repsTreino })
+            task.wait(velTreino)
+        else
+            task.wait(0.25)
+        end
+    end
 end)
 
--- fallback: varredura de botoes na Overlay (caso o hook nao pegue)
+--==================================================================--
+--  BALOES (pops) — clica sozinho nos bonus que aparecem
+--==================================================================--
 task.spawn(function()
     local overlay
     while true do
-        if State.autoPops then
+        if S.baloes then
             if not (overlay and overlay.Parent) then
                 overlay = nil
                 pcall(function()
                     local pg = LP:FindFirstChildOfClass("PlayerGui")
-                    for _, g in ipairs(pg:GetChildren()) do
-                        local o = g:FindFirstChild("Overlay", true)
-                        if o then overlay = o break end
+                    if not pg then return end
+                    -- o jogo guarda os pops dentro da tela "Screen" (Overlay)
+                    local screen = pg:FindFirstChild("Screen")
+                    if screen then
+                        overlay = screen:FindFirstChild("Overlay", true)
+                    end
+                    if not overlay then
+                        for _, g in ipairs(pg:GetChildren()) do
+                            local o = g:FindFirstChild("Overlay", true)
+                            if o then overlay = o break end
+                        end
                     end
                 end)
             end
             if overlay then
                 for _, d in ipairs(overlay:GetDescendants()) do
                     if d:IsA("GuiButton") and d.Visible then
+                        -- 1) dispara os eventos do botao
                         pcall(function()
                             for _, c in ipairs(getconnections(d.Activated)) do
                                 c:Fire()
                             end
+                        end)
+                        -- 2) garantia: clique real na posicao do botao
+                        pcall(function()
+                            local p = d.AbsolutePosition + d.AbsoluteSize / 2
+                            VIM:SendMouseButtonEvent(p.X, p.Y, 0, true, game, 0)
+                            task.wait(0.03)
+                            VIM:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 0)
                         end)
                     end
                 end
@@ -254,23 +315,24 @@ task.spawn(function()
 end)
 
 --==================================================================--
---  AUTO BAU
+--  BAUS
 --==================================================================--
 task.spawn(function()
     while true do
-        if State.autoBau then
+        if S.baus then
             pcall(function()
                 local chests = Workspace.World.Shared:FindFirstChild("Chests")
                 if chests then
                     for _, m in ipairs(chests:GetChildren()) do
-                        if not State.autoBau then break end
+                        if not S.baus then break end
                         local part = m:FindFirstChildWhichIsA("BasePart", true)
                         local prompt = m:FindFirstChildWhichIsA("ProximityPrompt", true)
                         if part and prompt and prompt.Enabled then
                             andarAte(part.Position, 25)
                             task.wait(0.3)
+                            pcall(function() prompt.HoldDuration = 0 end)
                             pcall(function() fireproximityprompt(prompt) end)
-                            task.wait(2.5)
+                            task.wait(2.5) -- animacao do giro
                         end
                     end
                 end
@@ -287,17 +349,17 @@ end)
 --==================================================================--
 task.spawn(function()
     while true do
-        if State.antiAfk then fire("AFK", nil, {}) end
+        if S.antiAfk then fire("AFK", nil, {}) end
         task.wait(25)
     end
 end)
 
 --==================================================================--
---  PROMPTS INSTANTANEOS (HoldDuration = 0)
+--  BOTOES INSTANTANEOS (sem segurar)
 --==================================================================--
 task.spawn(function()
     while true do
-        if State.promptsInstant then
+        if S.botoesRapidos then
             pcall(function()
                 for _, d in ipairs(Workspace:GetDescendants()) do
                     if d:IsA("ProximityPrompt") and d.HoldDuration > 0 then
@@ -311,25 +373,23 @@ task.spawn(function()
 end)
 
 --==================================================================--
---  ATRAVESSAR BARREIRAS (portoes de Strength — typo "Barries" e do jogo)
+--  ATRAVESSAR PORTOES (colisao client-side — pasta "Barries", typo do jogo)
 --==================================================================--
-local barreirasSalvas = {}
+local portoesSalvos = {}
 
-local function aplicarBarreiras(semColisao)
+local function aplicarPortoes(semColisao)
     pcall(function()
         local pasta = Workspace.World.Client:FindFirstChild("Barries")
         if not pasta then return end
         for _, d in ipairs(pasta:GetDescendants()) do
             if d:IsA("BasePart") then
                 if semColisao then
-                    if barreirasSalvas[d] == nil then
-                        barreirasSalvas[d] = d.CanCollide
+                    if portoesSalvos[d] == nil then
+                        portoesSalvos[d] = d.CanCollide
                     end
                     d.CanCollide = false
-                else
-                    if barreirasSalvas[d] ~= nil then
-                        d.CanCollide = barreirasSalvas[d]
-                    end
+                elseif portoesSalvos[d] ~= nil then
+                    d.CanCollide = portoesSalvos[d]
                 end
             end
         end
@@ -338,20 +398,46 @@ end
 
 task.spawn(function()
     while true do
-        if State.atravessar then aplicarBarreiras(true) end
+        if S.portoes then aplicarPortoes(true) end
         task.wait(1)
     end
 end)
 
 --==================================================================--
---  WALKSPEED TRAVADO
+--  MANTER VELOCIDADE
 --==================================================================--
 RunService.Heartbeat:Connect(function()
-    if State.travarSpeed then
+    if S.manterVel then
         local h = hum()
-        if h and h.WalkSpeed ~= speedAlvo then
-            h.WalkSpeed = speedAlvo
+        if h and h.WalkSpeed ~= velAndar then
+            h.WalkSpeed = velAndar
         end
+    end
+end)
+
+--==================================================================--
+--  TESTE AUTOMATICO DOS REMOTES (roda ao abrir)
+--==================================================================--
+task.spawn(function()
+    task.wait(4) -- espera o jogo carregar
+    if not BridgeNet then
+        warn("[KoalaCubo] BridgeNet2 nao encontrado — modo rapido desligado. Use o MODO SEGURO.")
+        aviso("Remotes indisponiveis. Liga o 'Modo seguro' na aba Farm — ele funciona sempre.", 8)
+        return
+    end
+    local antes = forca()
+    fire("Cubes", nil, { 1 })
+    task.wait(0.3)
+    fire("Cubes", "FinishLift", { 1 })
+    task.wait(1.2)
+    local depois = forca()
+    if depois > antes then
+        REMOTES_OK = true
+        print(("[KoalaCubo] TESTE OK — remotes funcionam (forca %s -> %s). Pode ligar tudo."):format(antes, depois))
+        aviso("Tudo funcionando! Liga o 'Levantar cubos sozinho' na aba Farm.", 6)
+    else
+        warn(("[KoalaCubo] TESTE FALHOU — servidor ignorou o remote (forca %s -> %s). Use o MODO SEGURO."):format(antes, depois))
+        aviso("Modo rapido bloqueado pelo jogo. Liga o 'Modo seguro' na aba Farm.", 8)
     end
 end)
 
@@ -371,180 +457,158 @@ local Window = Koala:CreateWindow({
 })
 
 --==================================================================--
---  TAB: FARM
+--  ABA: FARM
 --==================================================================--
-local FarmTab = Window:Tab({ Title = "Farm", Icon = "zap" })
+local Farm = Window:Tab({ Title = "Farm", Icon = "zap" })
 
-FarmTab:Section({ Title = "Auto Lift" })
+Farm:Section({ Title = "Levantar cubos (ganha forca)" })
 
-local cuboNomes = { "Auto (menor cubo)" }
-for _, idx in ipairs(listarCubos()) do
-    table.insert(cuboNomes, "Cubo " .. idx)
-end
+Farm:Toggle({
+    Title = "Levantar cubos sozinho",
+    Desc = "Rapido. Liga e olha sua forca subir na aba Status.",
+    Value = false,
+    Callback = function(v)
+        S.lift = v
+        if v and not REMOTES_OK then
+            aviso("Remote bloqueado — liga tambem o 'Modo seguro' aqui embaixo.", 5)
+        end
+    end,
+})
 
-local ddCubos
-ddCubos = FarmTab:Dropdown({
-    Title = "Cubo alvo",
-    Desc = "'Auto' pega sempre o menor cubo disponivel (mais facil, refresh-proof)",
-    Values = cuboNomes,
-    Value = "Auto (menor cubo)",
+Farm:Toggle({
+    Title = "Modo seguro (usa os botoes do jogo)",
+    Desc = "Mais lento, mas funciona sempre. Use se o rapido nao subir sua forca.",
+    Value = false,
+    Callback = function(v)
+        S.liftSeguro = v
+    end,
+})
+
+Farm:Dropdown({
+    Title = "Qual cubo",
+    Desc = "O automatico sempre pega o cubo mais fraco do mapa",
+    Values = (function()
+        local t = { "Automatico (mais fraco)" }
+        for _, c in ipairs(listarCubos()) do
+            table.insert(t, "Cubo " .. c.idx)
+        end
+        return t
+    end)(),
+    Value = "Automatico (mais fraco)",
     Callback = function(v)
         cuboAlvo = tonumber(v:match("%d+")) or 0
     end,
 })
 
--- auto-atualiza a lista quando os cubos dao refresh
-task.spawn(function()
-    while true do
-        task.wait(10)
-        local novos = { "Auto (menor cubo)" }
-        for _, idx in ipairs(listarCubos()) do
-            table.insert(novos, "Cubo " .. idx)
-        end
-        if #novos ~= #cuboNomes then
-            cuboNomes = novos
-            pcall(function() ddCubos:Refresh(novos) end)
-        end
-    end
-end)
-
-FarmTab:Slider({
-    Title = "Intervalo do lift",
-    Desc = "Tempo entre ciclos (menor = mais rapido; 0.05 = maximo)",
-    Value = { Min = 0.05, Max = 1, Default = 0.1, Step = 0.05 },
-    Callback = function(v)
-        liftIntervalo = tonumber(v) or 0.1
-    end,
-})
-
-FarmTab:Slider({
-    Title = "Rajada (ciclos por tick)",
-    Desc = "Quantos abrir+concluir por ciclo. Sobe o ganho, mas o servidor pode ignorar excesso",
-    Value = { Min = 1, Max = 10, Default = 1, Step = 1 },
-    Callback = function(v)
-        liftRajada = math.floor(tonumber(v) or 1)
-    end,
-})
-
-FarmTab:Toggle({
-    Title = "Auto Lift",
-    Desc = "Abre e conclui o cubo em loop. Olha a aba Status — se a Strength dispara, o server nao mede tempo",
-    Value = false,
-    Callback = function(v)
-        State.autoLift = v
-        notify("Auto Lift", v and "Ligado" or "Desligado", 2)
-    end,
-})
-
-FarmTab:Section({ Title = "Auto Train (flexao)" })
-
-FarmTab:Slider({
-    Title = "Reps por pacote",
-    Desc = "O jogo manda 1 naturalmente; mais = mais forca por pacote (se o server aceitar)",
-    Value = { Min = 1, Max = 500, Default = 1, Step = 1 },
-    Callback = function(v)
-        trainReps = math.max(1, math.floor(tonumber(v) or 1))
-    end,
-})
-
-FarmTab:Slider({
-    Title = "Intervalo do treino",
-    Desc = "Tempo entre pacotes (0.05 = maximo)",
+Farm:Slider({
+    Title = "Velocidade",
+    Desc = "Rapido demais pode ser ignorado pelo jogo. Se nao subir, aumente o tempo.",
     Value = { Min = 0.05, Max = 1, Default = 0.15, Step = 0.05 },
     Callback = function(v)
-        trainIntervalo = tonumber(v) or 0.15
+        velLift = tonumber(v) or 0.15
     end,
 })
 
-FarmTab:Toggle({
-    Title = "Auto Train",
-    Desc = "Manda pacotes de treino em loop, sem fazer flexao",
+Farm:Section({ Title = "Treinar (flexao — forca em qualquer lugar)" })
+
+Farm:Toggle({
+    Title = "Treinar sozinho",
+    Desc = "Faz flexao sem parar, sem precisar ir na zona de treino.",
     Value = false,
     Callback = function(v)
-        State.autoTrain = v
-        notify("Auto Train", v and "Ligado" or "Desligado", 2)
+        S.treino = v
+        if v and not REMOTES_OK then
+            aviso("Treino precisa do remote, e ele esta bloqueado neste jogo.", 5)
+        end
+    end,
+})
+
+Farm:Slider({
+    Title = "Forca por vez",
+    Desc = "Quanto cada pacote vale. Se nao funcionar, deixe em 1.",
+    Value = { Min = 1, Max = 100, Default = 1, Step = 1 },
+    Callback = function(v)
+        repsTreino = math.max(1, math.floor(tonumber(v) or 1))
     end,
 })
 
 --==================================================================--
---  TAB: EXTRAS
+--  ABA: COLETAR
 --==================================================================--
-local ExtrasTab = Window:Tab({ Title = "Extras", Icon = "gift" })
+local Coletar = Window:Tab({ Title = "Coletar", Icon = "gift" })
 
-ExtrasTab:Section({ Title = "Coletaveis" })
+Coletar:Section({ Title = "Bonus" })
 
-ExtrasTab:Toggle({
-    Title = "Auto Pops (instantaneo)",
-    Desc = "Hook na bridge: coleta o pop no instante em que o servidor spawna — sem clicar",
+Coletar:Toggle({
+    Title = "Pegar baloes sozinho",
+    Desc = "Coleta os baloes de bonus que aparecem na tela.",
     Value = false,
-    Callback = function(v) State.autoPops = v end,
+    Callback = function(v) S.baloes = v end,
 })
 
-ExtrasTab:Toggle({
-    Title = "Auto Bau",
-    Desc = "Anda ate os baus e abre (combine com Prompts Instantaneos)",
+Coletar:Toggle({
+    Title = "Abrir baus sozinho",
+    Desc = "Vai ate cada bau do mapa e abre. Junto com 'Botoes rapidos' fica melhor.",
     Value = false,
-    Callback = function(v) State.autoBau = v end,
+    Callback = function(v) S.baus = v end,
 })
 
-ExtrasTab:Section({ Title = "Movimento / mundo" })
+Coletar:Toggle({
+    Title = "Botoes rapidos",
+    Desc = "Baus e cubos abrem na hora, sem segurar o botao.",
+    Value = false,
+    Callback = function(v) S.botoesRapidos = v end,
+})
 
-ExtrasTab:Toggle({
-    Title = "Atravessar barreiras",
-    Desc = "Remove a colisao dos portoes de Strength — entra em qualquer zona",
+--==================================================================--
+--  ABA: MOVIMENTO
+--==================================================================--
+local Mov = Window:Tab({ Title = "Movimento", Icon = "run" })
+
+Mov:Section({ Title = "Mapa" })
+
+Mov:Toggle({
+    Title = "Atravessar portoes",
+    Desc = "Passa pelos portoes de forca sem ter a forca necessaria.",
     Value = false,
     Callback = function(v)
-        State.atravessar = v
-        aplicarBarreiras(v)
+        S.portoes = v
+        aplicarPortoes(v)
     end,
 })
 
-ExtrasTab:Toggle({
-    Title = "Prompts instantaneos",
-    Desc = "HoldDuration = 0 em todos os ProximityPrompts (bau/cubo abrem sem segurar)",
-    Value = false,
-    Callback = function(v) State.promptsInstant = v end,
-})
+Mov:Section({ Title = "Velocidade" })
 
-ExtrasTab:Slider({
-    Title = "WalkSpeed",
-    Desc = "Velocidade alvo",
+Mov:Slider({
+    Title = "Velocidade de andar",
+    Desc = "O normal do jogo e 16.",
     Value = { Min = 16, Max = 250, Default = 16, Step = 1 },
     Callback = function(v)
-        speedAlvo = tonumber(v) or 16
+        velAndar = tonumber(v) or 16
         local h = hum()
-        if h then h.WalkSpeed = speedAlvo end
+        if h then h.WalkSpeed = velAndar end
     end,
 })
 
-ExtrasTab:Toggle({
-    Title = "Travar WalkSpeed",
-    Desc = "Reaplica a velocidade todo frame — o jogo nao reseta mais",
+Mov:Toggle({
+    Title = "Manter velocidade",
+    Desc = "Impede o jogo de voltar sua velocidade ao normal.",
     Value = false,
-    Callback = function(v) State.travarSpeed = v end,
+    Callback = function(v) S.manterVel = v end,
 })
 
-ExtrasTab:Section({ Title = "Utilidades" })
+Mov:Section({ Title = "Outros" })
 
-ExtrasTab:Toggle({
+Mov:Toggle({
     Title = "Anti-AFK",
-    Desc = "Ping nativo do jogo a cada 25s",
+    Desc = "O jogo nao te chuta por ficar parado.",
     Value = true,
-    Callback = function(v) State.antiAfk = v end,
+    Callback = function(v) S.antiAfk = v end,
 })
 
-ExtrasTab:Button({
-    Title = "Resgatar recompensa do grupo",
-    Desc = "Tenta o claim do GroupReward (precisa estar no grupo + 3 convites — o servidor valida)",
-    Callback = function()
-        fire("GroupReward", nil, {})
-        notify("GroupReward", "Pacote enviado — se faltar requisito o servidor ignora", 3)
-    end,
-})
-
-ExtrasTab:Button({
-    Title = "Respawn",
-    Desc = "Mata o personagem e renasce no spawn",
+Mov:Button({
+    Title = "Renascer",
+    Desc = "Volta pro spawn (se travar em algum lugar).",
     Callback = function()
         local h = hum()
         if h then h.Health = 0 end
@@ -552,16 +616,17 @@ ExtrasTab:Button({
 })
 
 --==================================================================--
---  TAB: STATUS
+--  ABA: STATUS
 --==================================================================--
-local StatusTab = Window:Tab({ Title = "Status", Icon = "info" })
+local Status = Window:Tab({ Title = "Status", Icon = "info" })
 
-StatusTab:Section({ Title = "Contadores ao vivo" })
+Status:Section({ Title = "Seus numeros (ao vivo)" })
 
-local lblForca, lblCash
+local lblForca, lblCash, lblSistema
 pcall(function()
-    lblForca = StatusTab:Paragraph({ Title = "Strength", Desc = "..." })
-    lblCash  = StatusTab:Paragraph({ Title = "Cash", Desc = "..." })
+    lblForca   = Status:Paragraph({ Title = "Forca", Desc = "..." })
+    lblCash    = Status:Paragraph({ Title = "Dinheiro", Desc = "..." })
+    lblSistema = Status:Paragraph({ Title = "Modo rapido (remotes)", Desc = "testando..." })
 end)
 
 task.spawn(function()
@@ -569,69 +634,51 @@ task.spawn(function()
         pcall(function()
             if lblForca then lblForca:SetDesc(tostring(forca())) end
             if lblCash then lblCash:SetDesc(tostring(dinheiro())) end
+            if lblSistema then
+                lblSistema:SetDesc(REMOTES_OK and "FUNCIONANDO — pode usar tudo"
+                    or "BLOQUEADO pelo jogo — use o Modo seguro na aba Farm")
+            end
         end)
         task.wait(1)
     end
 end)
 
-StatusTab:Section({ Title = "Testes (antes/depois)" })
+Status:Section({ Title = "Testar de novo" })
 
-StatusTab:Button({
-    Title = "Teste: concluir cubo 1 agora",
-    Desc = "Dispara abrir+FinishLift uma vez e compara a Strength",
+Status:Button({
+    Title = "Testar se o modo rapido funciona",
+    Desc = "Levanta o cubo 1 uma vez e ve se sua forca sobe.",
     Callback = function()
         local antes = forca()
         fire("Cubes", nil, { 1 })
         task.wait(0.3)
         fire("Cubes", "FinishLift", { 1 })
-        task.wait(0.5)
-        local depois = forca()
-        notify("Teste Lift", ("Antes: %s | Depois: %s"):format(tostring(antes), tostring(depois)), 5)
-    end,
-})
-
-StatusTab:Button({
-    Title = "Teste: pacote de treino",
-    Desc = "Manda 1 pacote Training e compara a Strength",
-    Callback = function()
-        local antes = forca()
-        fire("Training", nil, { trainReps })
-        task.wait(0.5)
-        local depois = forca()
-        notify("Teste Train", ("Antes: %s | Depois: %s"):format(tostring(antes), tostring(depois)), 5)
-    end,
-})
-
-StatusTab:Button({
-    Title = "Teste: rajada (10x cubo 1)",
-    Desc = "Dispara 10 ciclos de uma vez — mostra se o servidor aceita rajada",
-    Callback = function()
-        local antes = forca()
-        for _ = 1, 10 do
-            fire("Cubes", nil, { 1 })
-            fire("Cubes", "FinishLift", { 1 })
-        end
         task.wait(1)
         local depois = forca()
-        notify("Teste Rajada", ("Antes: %s | Depois: %s"):format(tostring(antes), tostring(depois)), 5)
+        if depois > antes then
+            REMOTES_OK = true
+            aviso(("Funcionou! Forca %s -> %s"):format(antes, depois), 4)
+        else
+            aviso(("Nao subiu (%s -> %s). Use o Modo seguro."):format(antes, depois), 5)
+        end
     end,
 })
 
-notify("Koala Cubo v2", "Carregado! Aba Farm = lift/treino turbo. Aba Status = testes e contadores.", 5)
+aviso("Koala Cubo carregado! Aba Farm > 'Levantar cubos sozinho'.", 5)
 
 --==================================================================--
---  RETORNO: integracao futura com o hub
+--  RETORNO: integracao com o hub
 --==================================================================--
 return function(KoalaRef, WindowRef, Flags)
     if not WindowRef then return end
     pcall(function()
         local tab = WindowRef:Tab({ Title = "Cubo", Icon = "box" })
-        tab:Toggle({ Title = "Auto Lift", Value = State.autoLift, Callback = function(v) State.autoLift = v end })
-        tab:Toggle({ Title = "Auto Train", Value = State.autoTrain, Callback = function(v) State.autoTrain = v end })
-        tab:Toggle({ Title = "Auto Pops", Value = State.autoPops, Callback = function(v) State.autoPops = v end })
-        tab:Toggle({ Title = "Auto Bau", Value = State.autoBau, Callback = function(v) State.autoBau = v end })
-        tab:Toggle({ Title = "Atravessar barreiras", Value = State.atravessar, Callback = function(v) State.atravessar = v aplicarBarreiras(v) end })
-        tab:Toggle({ Title = "Prompts instantaneos", Value = State.promptsInstant, Callback = function(v) State.promptsInstant = v end })
-        tab:Toggle({ Title = "Anti-AFK", Value = State.antiAfk, Callback = function(v) State.antiAfk = v end })
+        tab:Toggle({ Title = "Levantar cubos sozinho", Value = S.lift, Callback = function(v) S.lift = v end })
+        tab:Toggle({ Title = "Modo seguro", Value = S.liftSeguro, Callback = function(v) S.liftSeguro = v end })
+        tab:Toggle({ Title = "Treinar sozinho", Value = S.treino, Callback = function(v) S.treino = v end })
+        tab:Toggle({ Title = "Pegar baloes sozinho", Value = S.baloes, Callback = function(v) S.baloes = v end })
+        tab:Toggle({ Title = "Abrir baus sozinho", Value = S.baus, Callback = function(v) S.baus = v end })
+        tab:Toggle({ Title = "Atravessar portoes", Value = S.portoes, Callback = function(v) S.portoes = v aplicarPortoes(v) end })
+        tab:Toggle({ Title = "Anti-AFK", Value = S.antiAfk, Callback = function(v) S.antiAfk = v end })
     end)
 end
