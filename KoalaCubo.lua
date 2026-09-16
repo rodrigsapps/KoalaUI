@@ -1,29 +1,30 @@
 --[[
     KOALA HUB — LEVANTE UM CUBO (Lift a Cube) — PlaceId 109530157755211
     -------------------------------------------------------------------
-    v1 — feito em cima do dump do KoalaSpy (fontes do client).
+    v2 — mais rapido, mais sistemas.
 
-    Como o jogo funciona (do dump):
-      * Toda comunicacao passa pelo BridgeNet2 (ReplicatedStorage.Packages.bridgenet2).
-      * Cada "controller" tem uma bridge: "<UserId>_<NomeDoController>"
-        ex: "9267263202_Cubes", "9267263202_Training", "9267263202_Pops".
-      * Formato: replicator:Fire({ Function = "...", Args = { ... } })
+    Novidades v2:
+      * AUTO LIFT TURBO: intervalo configuravel (ate 0.05s) + rajada
+        (varios ciclos abrir/concluir por tick). Muito mais rapido que v1.
+      * AUTO POPS 2.0: agora pega pelo HOOK da bridge — no instante em
+        que o servidor spawna o pop, a coleta volta pelo remote. Nao
+        depende mais de clicar em botao na tela. (varredura de UI fica
+        como fallback.)
+      * ATRAVESSAR BARREIRAS: desliga a colisao dos portoes de Strength
+        (World.Client.Barries) — entra nas zonas sem ter forca.
+      * PROMPTS INSTANTANEOS: HoldDuration = 0 em todos os
+        ProximityPrompts (bau abre sem segurar).
+      * LISTA DE CUBOS AUTO-ATUALIZADA: quando o jogo da refresh nos
+        cubos, o dropdown se refaz sozinho. Modo "Auto" pega sempre o
+        menor cubo disponivel.
+      * STATUS AO VIVO: Strength e Cash atualizando a cada segundo.
+      * WalkSpeed TRAVADO (o jogo nao reseta mais).
 
-    Funcoes deste script:
-      * AUTO LIFT: abre o cubo escolhido (Args={index}) e conclui
-        (Function="FinishLift", Args={index}) em loop. SE o servidor
-        nao medir o tempo, o ganho e instantaneo. Se medir, ele paga
-        so o proporcional — liga e ve se a forca sobe rapido.
-      * AUTO TRAIN: repete o pacote de treino (Training, Args={reps})
-        que o proprio jogo manda quando voce faz flexao. Funciona SEM
-        precisar estar na zona de treino? Depende da validacao do
-        servidor — testa dentro e fora da zona e me fala.
-      * AUTO POPS: clica sozinho nos baloes/botoes que aparecem na tela
-        (server manda spawnar, o claim e confirmado pelo servidor).
-      * AUTO BAU: teleporta ate os baus (World.Shared.Chests) e ativa
-        o ProximityPrompt — abre de graca se tiver no raio.
-      * ANTI-AFK: manda o ping do controller AFK a cada 25s.
-      * SPEED: WalkSpeed direto + sem o lock de treino.
+    Formato dos remotes (do dump, BridgeNet2):
+      bridge = "<UserId>_<Controller>", pacote = { Function, Args }
+      Cubes: abrir {Args={idx}} | concluir {Function="FinishLift", Args={idx}}
+      Training: {Args={reps}} | Pops: claim {Args={id}}
+      AFK: {Args={}} a cada 30s
 
     Uso:
       loadstring(game:HttpGet("https://raw.githubusercontent.com/rodrigsapps/KoalaUI/main/KoalaCubo.lua"))()
@@ -53,7 +54,9 @@ local function bridge(nome)
         local ok, b = pcall(function()
             return BridgeNet.ReferenceBridge(uid .. "_" .. nome)
         end)
-        if ok then bridges[nome] = b else
+        if ok then
+            bridges[nome] = b
+        else
             warn("[KoalaCubo] falha ao criar bridge: " .. nome)
             return nil
         end
@@ -95,6 +98,11 @@ local function forca()
     return ok and v or 0
 end
 
+local function dinheiro()
+    local ok, v = pcall(function() return LP:GetAttribute("Cash") end)
+    return ok and v or 0
+end
+
 local function andarAte(pos, timeout)
     local h, r = hum(), hrp()
     if not h or not r then return false end
@@ -111,7 +119,7 @@ local function andarAte(pos, timeout)
 end
 
 --==================================================================--
---  CUBOS DISPONIVEIS (workspace.World.Shared.Cubes, nome = index)
+--  CUBOS (workspace.World.Shared.Cubes, nome numerico = index)
 --==================================================================--
 local function pastaCubos()
     local ok, f = pcall(function()
@@ -136,50 +144,83 @@ local function listarCubos()
 end
 
 --==================================================================--
---  AUTO LIFT
+--  ESTADO
 --==================================================================--
-local State = { autoLift = false, autoTrain = false, autoPops = false, autoBau = false, antiAfk = true }
-local cuboAlvo = 1
+local State = {
+    autoLift = false,
+    autoTrain = false,
+    autoPops = false,
+    autoBau = false,
+    antiAfk = true,
+    promptsInstant = false,
+    atravessar = false,
+    travarSpeed = false,
+}
 
+local cuboAlvo = 1          -- 0 = Auto (menor disponivel)
+local liftIntervalo = 0.1   -- s entre ciclos
+local liftRajada = 1        -- ciclos abrir+concluir por tick
+local trainReps = 1
+local trainIntervalo = 0.15
+local speedAlvo = 16
+
+--==================================================================--
+--  AUTO LIFT (turbo: intervalo + rajada configuraveis)
+--==================================================================--
 task.spawn(function()
     while true do
         if State.autoLift then
-            local f = pastaCubos()
             local idx = cuboAlvo
-            if f and not f:FindFirstChild(tostring(idx)) then
-                -- cubo sumiu (refresh) — pega o menor disponivel
+            if idx == 0 then
                 local lista = listarCubos()
-                if #lista > 0 then idx = lista[1] end
+                idx = #lista > 0 and lista[1] or 1
             end
-            fire("Cubes", nil, { idx })            -- abre o lift
-            task.wait(0.25)
-            fire("Cubes", "FinishLift", { idx })   -- conclui
-            task.wait(0.25)
+            for _ = 1, liftRajada do
+                fire("Cubes", nil, { idx })
+                fire("Cubes", "FinishLift", { idx })
+            end
+            task.wait(liftIntervalo)
         else
-            task.wait(0.3)
+            task.wait(0.25)
         end
     end
 end)
 
 --==================================================================--
---  AUTO TRAIN (repete o pacote de flexao do jogo)
+--  AUTO TRAIN
 --==================================================================--
-local trainReps = 1
-
 task.spawn(function()
     while true do
         if State.autoTrain then
             fire("Training", nil, { trainReps })
-            task.wait(0.25)
+            task.wait(trainIntervalo)
         else
-            task.wait(0.3)
+            task.wait(0.25)
         end
     end
 end)
 
 --==================================================================--
---  AUTO POPS (baloes/botoes da UI do jogo)
+--  AUTO POPS v2 — hook da bridge (claim instantaneo via remote)
 --==================================================================--
+task.spawn(function()
+    task.wait(3) -- deixa o jogo criar as bridges primeiro
+    local b = bridge("Pops")
+    if not b then return end
+    pcall(function()
+        b:Connect(function(pacote)
+            if not State.autoPops then return end
+            if type(pacote) == "table" and pacote.Function == "Spawn" then
+                local id = pacote.Args and pacote.Args[1]
+                if type(id) == "number" then
+                    fire("Pops", nil, { id })
+                end
+            end
+        end)
+    end)
+end)
+
+-- fallback: varredura de botoes na Overlay (caso o hook nao pegue)
 task.spawn(function()
     local overlay
     while true do
@@ -205,7 +246,7 @@ task.spawn(function()
                     end
                 end
             end
-            task.wait(0.3)
+            task.wait(0.4)
         else
             task.wait(0.5)
         end
@@ -213,7 +254,7 @@ task.spawn(function()
 end)
 
 --==================================================================--
---  AUTO BAU (chests)
+--  AUTO BAU
 --==================================================================--
 task.spawn(function()
     while true do
@@ -229,7 +270,7 @@ task.spawn(function()
                             andarAte(part.Position, 25)
                             task.wait(0.3)
                             pcall(function() fireproximityprompt(prompt) end)
-                            task.wait(3) -- animacao do roll
+                            task.wait(2.5)
                         end
                     end
                 end
@@ -242,12 +283,75 @@ task.spawn(function()
 end)
 
 --==================================================================--
---  ANTI-AFK (ping nativo do jogo, a cada 25s)
+--  ANTI-AFK
 --==================================================================--
 task.spawn(function()
     while true do
         if State.antiAfk then fire("AFK", nil, {}) end
         task.wait(25)
+    end
+end)
+
+--==================================================================--
+--  PROMPTS INSTANTANEOS (HoldDuration = 0)
+--==================================================================--
+task.spawn(function()
+    while true do
+        if State.promptsInstant then
+            pcall(function()
+                for _, d in ipairs(Workspace:GetDescendants()) do
+                    if d:IsA("ProximityPrompt") and d.HoldDuration > 0 then
+                        d.HoldDuration = 0
+                    end
+                end
+            end)
+        end
+        task.wait(2)
+    end
+end)
+
+--==================================================================--
+--  ATRAVESSAR BARREIRAS (portoes de Strength — typo "Barries" e do jogo)
+--==================================================================--
+local barreirasSalvas = {}
+
+local function aplicarBarreiras(semColisao)
+    pcall(function()
+        local pasta = Workspace.World.Client:FindFirstChild("Barries")
+        if not pasta then return end
+        for _, d in ipairs(pasta:GetDescendants()) do
+            if d:IsA("BasePart") then
+                if semColisao then
+                    if barreirasSalvas[d] == nil then
+                        barreirasSalvas[d] = d.CanCollide
+                    end
+                    d.CanCollide = false
+                else
+                    if barreirasSalvas[d] ~= nil then
+                        d.CanCollide = barreirasSalvas[d]
+                    end
+                end
+            end
+        end
+    end)
+end
+
+task.spawn(function()
+    while true do
+        if State.atravessar then aplicarBarreiras(true) end
+        task.wait(1)
+    end
+end)
+
+--==================================================================--
+--  WALKSPEED TRAVADO
+--==================================================================--
+RunService.Heartbeat:Connect(function()
+    if State.travarSpeed then
+        local h = hum()
+        if h and h.WalkSpeed ~= speedAlvo then
+            h.WalkSpeed = speedAlvo
+        end
     end
 end)
 
@@ -266,53 +370,95 @@ local Window = Koala:CreateWindow({
     ToggleKey = Enum.KeyCode.RightControl,
 })
 
--- TAB: Farm
+--==================================================================--
+--  TAB: FARM
+--==================================================================--
 local FarmTab = Window:Tab({ Title = "Farm", Icon = "zap" })
 
-FarmTab:Section({ Title = "Levantar cubos" })
+FarmTab:Section({ Title = "Auto Lift" })
 
-local cuboNomes = {}
-do
-    for _, idx in ipairs(listarCubos()) do
-        table.insert(cuboNomes, "Cubo " .. idx)
-    end
-    if #cuboNomes == 0 then cuboNomes = { "Cubo 1" } end
+local cuboNomes = { "Auto (menor cubo)" }
+for _, idx in ipairs(listarCubos()) do
+    table.insert(cuboNomes, "Cubo " .. idx)
 end
 
-FarmTab:Dropdown({
+local ddCubos
+ddCubos = FarmTab:Dropdown({
     Title = "Cubo alvo",
-    Desc = "Qual cubo levantar (indice da pasta World.Shared.Cubes)",
+    Desc = "'Auto' pega sempre o menor cubo disponivel (mais facil, refresh-proof)",
     Values = cuboNomes,
-    Value = cuboNomes[1],
+    Value = "Auto (menor cubo)",
     Callback = function(v)
-        cuboAlvo = tonumber(v:match("%d+")) or 1
+        cuboAlvo = tonumber(v:match("%d+")) or 0
+    end,
+})
+
+-- auto-atualiza a lista quando os cubos dao refresh
+task.spawn(function()
+    while true do
+        task.wait(10)
+        local novos = { "Auto (menor cubo)" }
+        for _, idx in ipairs(listarCubos()) do
+            table.insert(novos, "Cubo " .. idx)
+        end
+        if #novos ~= #cuboNomes then
+            cuboNomes = novos
+            pcall(function() ddCubos:Refresh(novos) end)
+        end
+    end
+end)
+
+FarmTab:Slider({
+    Title = "Intervalo do lift",
+    Desc = "Tempo entre ciclos (menor = mais rapido; 0.05 = maximo)",
+    Value = { Min = 0.05, Max = 1, Default = 0.1, Step = 0.05 },
+    Callback = function(v)
+        liftIntervalo = tonumber(v) or 0.1
+    end,
+})
+
+FarmTab:Slider({
+    Title = "Rajada (ciclos por tick)",
+    Desc = "Quantos abrir+concluir por ciclo. Sobe o ganho, mas o servidor pode ignorar excesso",
+    Value = { Min = 1, Max = 10, Default = 1, Step = 1 },
+    Callback = function(v)
+        liftRajada = math.floor(tonumber(v) or 1)
     end,
 })
 
 FarmTab:Toggle({
-    Title = "Auto Lift (instantaneo?)",
-    Desc = "Abre e conclui o cubo em loop. Se o server nao medir tempo, a forca sobe MUITO rapido. Olha o contador de Strength.",
+    Title = "Auto Lift",
+    Desc = "Abre e conclui o cubo em loop. Olha a aba Status — se a Strength dispara, o server nao mede tempo",
     Value = false,
     Callback = function(v)
         State.autoLift = v
-        notify("Auto Lift", v and "Ligado no cubo " .. cuboAlvo or "Desligado", 2)
+        notify("Auto Lift", v and "Ligado" or "Desligado", 2)
     end,
 })
 
-FarmTab:Section({ Title = "Treino (forca passiva)" })
+FarmTab:Section({ Title = "Auto Train (flexao)" })
 
 FarmTab:Slider({
     Title = "Reps por pacote",
-    Desc = "Quantas flexoes o pacote reporta (o jogo manda 1 por vez naturalmente)",
-    Value = { Min = 1, Max = 50, Default = 1 },
+    Desc = "O jogo manda 1 naturalmente; mais = mais forca por pacote (se o server aceitar)",
+    Value = { Min = 1, Max = 500, Default = 1, Step = 1 },
     Callback = function(v)
-        trainReps = math.floor(tonumber(v) or 1)
+        trainReps = math.max(1, math.floor(tonumber(v) or 1))
+    end,
+})
+
+FarmTab:Slider({
+    Title = "Intervalo do treino",
+    Desc = "Tempo entre pacotes (0.05 = maximo)",
+    Value = { Min = 0.05, Max = 1, Default = 0.15, Step = 0.05 },
+    Callback = function(v)
+        trainIntervalo = tonumber(v) or 0.15
     end,
 })
 
 FarmTab:Toggle({
     Title = "Auto Train",
-    Desc = "Manda o pacote de treino do jogo em loop, sem precisar ficar fazendo flexao",
+    Desc = "Manda pacotes de treino em loop, sem fazer flexao",
     Value = false,
     Callback = function(v)
         State.autoTrain = v
@@ -320,68 +466,119 @@ FarmTab:Toggle({
     end,
 })
 
--- TAB: Extras
+--==================================================================--
+--  TAB: EXTRAS
+--==================================================================--
 local ExtrasTab = Window:Tab({ Title = "Extras", Icon = "gift" })
 
 ExtrasTab:Section({ Title = "Coletaveis" })
 
 ExtrasTab:Toggle({
-    Title = "Auto Pops",
-    Desc = "Clica sozinho nos baloes/bonus que aparecem na tela",
+    Title = "Auto Pops (instantaneo)",
+    Desc = "Hook na bridge: coleta o pop no instante em que o servidor spawna — sem clicar",
     Value = false,
     Callback = function(v) State.autoPops = v end,
 })
 
 ExtrasTab:Toggle({
     Title = "Auto Bau",
-    Desc = "Anda ate os baus do mapa e abre (prompt do jogo)",
+    Desc = "Anda ate os baus e abre (combine com Prompts Instantaneos)",
     Value = false,
     Callback = function(v) State.autoBau = v end,
+})
+
+ExtrasTab:Section({ Title = "Movimento / mundo" })
+
+ExtrasTab:Toggle({
+    Title = "Atravessar barreiras",
+    Desc = "Remove a colisao dos portoes de Strength — entra em qualquer zona",
+    Value = false,
+    Callback = function(v)
+        State.atravessar = v
+        aplicarBarreiras(v)
+    end,
+})
+
+ExtrasTab:Toggle({
+    Title = "Prompts instantaneos",
+    Desc = "HoldDuration = 0 em todos os ProximityPrompts (bau/cubo abrem sem segurar)",
+    Value = false,
+    Callback = function(v) State.promptsInstant = v end,
+})
+
+ExtrasTab:Slider({
+    Title = "WalkSpeed",
+    Desc = "Velocidade alvo",
+    Value = { Min = 16, Max = 250, Default = 16, Step = 1 },
+    Callback = function(v)
+        speedAlvo = tonumber(v) or 16
+        local h = hum()
+        if h then h.WalkSpeed = speedAlvo end
+    end,
+})
+
+ExtrasTab:Toggle({
+    Title = "Travar WalkSpeed",
+    Desc = "Reaplica a velocidade todo frame — o jogo nao reseta mais",
+    Value = false,
+    Callback = function(v) State.travarSpeed = v end,
 })
 
 ExtrasTab:Section({ Title = "Utilidades" })
 
 ExtrasTab:Toggle({
     Title = "Anti-AFK",
-    Desc = "Ping nativo do jogo a cada 25s — fica online sem chutar",
+    Desc = "Ping nativo do jogo a cada 25s",
     Value = true,
     Callback = function(v) State.antiAfk = v end,
 })
 
-ExtrasTab:Slider({
-    Title = "WalkSpeed",
-    Desc = "Velocidade do personagem",
-    Value = { Min = 16, Max = 150, Default = 16 },
-    Callback = function(v)
-        local h = hum()
-        if h then h.WalkSpeed = tonumber(v) or 16 end
+ExtrasTab:Button({
+    Title = "Resgatar recompensa do grupo",
+    Desc = "Tenta o claim do GroupReward (precisa estar no grupo + 3 convites — o servidor valida)",
+    Callback = function()
+        fire("GroupReward", nil, {})
+        notify("GroupReward", "Pacote enviado — se faltar requisito o servidor ignora", 3)
     end,
 })
 
--- TAB: Status
+ExtrasTab:Button({
+    Title = "Respawn",
+    Desc = "Mata o personagem e renasce no spawn",
+    Callback = function()
+        local h = hum()
+        if h then h.Health = 0 end
+    end,
+})
+
+--==================================================================--
+--  TAB: STATUS
+--==================================================================--
 local StatusTab = Window:Tab({ Title = "Status", Icon = "info" })
 
-StatusTab:Section({ Title = "Contadores" })
+StatusTab:Section({ Title = "Contadores ao vivo" })
 
-local lblForca = nil
+local lblForca, lblCash
 pcall(function()
     lblForca = StatusTab:Paragraph({ Title = "Strength", Desc = "..." })
+    lblCash  = StatusTab:Paragraph({ Title = "Cash", Desc = "..." })
 end)
 
 task.spawn(function()
     while true do
         pcall(function()
-            if lblForca and lblForca.SetDesc then
-                lblForca:SetDesc("Strength: " .. tostring(forca()))
-            end
+            if lblForca then lblForca:SetDesc(tostring(forca())) end
+            if lblCash then lblCash:SetDesc(tostring(dinheiro())) end
         end)
         task.wait(1)
     end
 end)
 
+StatusTab:Section({ Title = "Testes (antes/depois)" })
+
 StatusTab:Button({
     Title = "Teste: concluir cubo 1 agora",
-    Desc = "Dispara abrir+FinishLift uma vez e olha se a Strength subiu",
+    Desc = "Dispara abrir+FinishLift uma vez e compara a Strength",
     Callback = function()
         local antes = forca()
         fire("Cubes", nil, { 1 })
@@ -405,7 +602,22 @@ StatusTab:Button({
     end,
 })
 
-notify("Koala Cubo", "Carregado! Abre a aba Farm e testa o Auto Lift. Me fala se a Strength dispara.", 5)
+StatusTab:Button({
+    Title = "Teste: rajada (10x cubo 1)",
+    Desc = "Dispara 10 ciclos de uma vez — mostra se o servidor aceita rajada",
+    Callback = function()
+        local antes = forca()
+        for _ = 1, 10 do
+            fire("Cubes", nil, { 1 })
+            fire("Cubes", "FinishLift", { 1 })
+        end
+        task.wait(1)
+        local depois = forca()
+        notify("Teste Rajada", ("Antes: %s | Depois: %s"):format(tostring(antes), tostring(depois)), 5)
+    end,
+})
+
+notify("Koala Cubo v2", "Carregado! Aba Farm = lift/treino turbo. Aba Status = testes e contadores.", 5)
 
 --==================================================================--
 --  RETORNO: integracao futura com o hub
@@ -418,6 +630,8 @@ return function(KoalaRef, WindowRef, Flags)
         tab:Toggle({ Title = "Auto Train", Value = State.autoTrain, Callback = function(v) State.autoTrain = v end })
         tab:Toggle({ Title = "Auto Pops", Value = State.autoPops, Callback = function(v) State.autoPops = v end })
         tab:Toggle({ Title = "Auto Bau", Value = State.autoBau, Callback = function(v) State.autoBau = v end })
+        tab:Toggle({ Title = "Atravessar barreiras", Value = State.atravessar, Callback = function(v) State.atravessar = v aplicarBarreiras(v) end })
+        tab:Toggle({ Title = "Prompts instantaneos", Value = State.promptsInstant, Callback = function(v) State.promptsInstant = v end })
         tab:Toggle({ Title = "Anti-AFK", Value = State.antiAfk, Callback = function(v) State.antiAfk = v end })
     end)
 end
