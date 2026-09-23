@@ -1,13 +1,12 @@
 --[[
-  KoalaVolei.lua — v2
+  KoalaVolei.lua — v3
   Script para [UPD] Lendas do Vôlei / Volleyball Legends (PlaceId 73956553001240)
   Parte do Koala Hub — discord.gg/ZRFffEgQQM
 
-  v2: corrigido hitbox (redimensiona a HitBox do jogo a cada frame, sem CanQuery=false),
-      auto-recepção/ataque por simulação de toque (padrão comprovado),
-      polyfills de funções de executor (corrige "Falha ao carregar UI"),
-      carregamento da UI com retry + espelho, hooks por instância direta,
-      ESP, anti-lag, noclip, farm de recompensas, códigos embutidos.
+  v3: reação por PREVISÃO DE TRAJETÓRIA (defesa/ataque/toque quase instantâneos),
+      hitbox dinâmica (cresce com bola rápida) + imã de bola,
+      AUTO SAQUE PERFEITO (mira pro lado adversário e saca sozinho na força ideal),
+      loop único otimizado por frame, polyfills de executor, UI com retry + espelhos.
 
   ATENÇÃO: uso por sua conta e risco.
 ]]
@@ -125,6 +124,7 @@ local R = {
   Interact        = rf("BallService", "Interact"),
   CreateHitbox    = rf("BallService", "CreateHitbox"),
   SpawnBall       = rf("BallService", "SpawnBall"),
+  SpawnServeBall  = rf("BallService", "SpawnServeBall"),
   Serve           = rf("GameService", "Serve"),
   ReturnParty     = rf("GameService", "ReturnPartyToLobby"),
   ReturnLobby     = rf("GameService", "ReturnToLobby"),
@@ -154,7 +154,7 @@ end
 local Estado = {
   bola = nil, bolaPart = nil, bolaId = nil,
   emJogo = false, ultimoBatedor = "", ultimoTipo = "",
-  sequencia = 0, ultimoTime = "",
+  sequencia = 0, ultimoTime = "", hitboxRaio = 3,
 }
 local function varrerBola()
   for _, m in ipairs(Workspace:GetChildren()) do
@@ -181,19 +181,19 @@ Workspace.ChildRemoved:Connect(function(f)
   if f == Estado.bola then definirBola(varrerBola()) end
 end)
 
-local function ligarAttr(obj, nome, campo)
+local function ligarAttr(obj, nome, campo, padrao)
   pcall(function()
-    Estado[campo] = obj:GetAttribute(nome) or Estado[campo]
+    Estado[campo] = obj:GetAttribute(nome) or padrao
     obj:GetAttributeChangedSignal(nome):Connect(function()
-      Estado[campo] = obj:GetAttribute(nome) or Estado[campo]
+      Estado[campo] = obj:GetAttribute(nome) or padrao
     end)
   end)
 end
-ligarAttr(RS, "IsBallInPlay", "emJogo")
-ligarAttr(RS, "LastHitter", "ultimoBatedor")
-ligarAttr(RS, "LastHitType", "ultimoTipo")
-ligarAttr(RS, "TeamHitStreak", "sequencia")
-ligarAttr(RS, "LastHitTeam", "ultimoTime")
+ligarAttr(RS, "IsBallInPlay", "emJogo", false)
+ligarAttr(RS, "LastHitter", "ultimoBatedor", "")
+ligarAttr(RS, "LastHitType", "ultimoTipo", "")
+ligarAttr(RS, "TeamHitStreak", "sequencia", 0)
+ligarAttr(RS, "LastHitTeam", "ultimoTime", "")
 
 local function meuTime() return tostring(LP.Team) end
 local function meuEstilo()
@@ -215,12 +215,19 @@ end
 -- 5) Config
 --============================================================================--
 local F = {
-  Hitbox = true, HitboxMult = 3, PingComp = true,
+  -- hitbox
+  Hitbox = true, HitboxMult = 3, PingComp = true, HitboxDinamica = true,
+  ImaBola = false, ImaDist = 14,
+  -- reação
+  ReacaoMs = 30,
   AutoRecepcao = false, AutoAtaque = false,
-  CorteNaMira = false, CargaMax = false, PasseFacil = false,
-  RecepcaoPerfeita = false, SaquePerfeito = false,
-  AutoEstilo = false, AlvoEstilo = "", AutoHab = false, AlvoHab = "",
-  AutoClaim = false,
+  -- hooks
+  CorteNaMira = false, CargaMax = false, PasseFacil = false, RecepcaoPerfeita = false,
+  -- saque
+  SaquePerfeito = true, AutoSaque = false, SaqueForca = 100,
+  -- spins / recompensas
+  AutoEstilo = false, AlvoEstilo = "", AutoHab = false, AlvoHab = "", AutoClaim = false,
+  -- física / visual
   Speed = false, SpeedVal = 16, Jump = false, JumpVal = 50, Noclip = false,
   ESPBola = false, ESPJogadores = false, Fullbright = false,
 }
@@ -230,7 +237,7 @@ local F = {
 --============================================================================--
 local okWin, Window = pcall(function()
   return Koala:CreateWindow({
-    Title = "Koala Vôlei v2",
+    Title = "Koala Vôlei v3",
     Icon = "volleyball",
     Author = "discord.gg/ZRFffEgQQM",
     Folder = "KoalaVolei",
@@ -263,7 +270,7 @@ local TabJogo = Window:Tab({ Title = "Jogo", Icon = "volleyball" })
 TabJogo:Section({ Title = "Hitbox da bola" })
 TabJogo:Toggle({
   Title = "Hitbox expandida",
-  Desc = "Aumenta a zona de toque da bola. Redimensiona a HitBox do jogo a cada frame.",
+  Desc = "Aumenta a zona de toque da bola (redimensionada a cada frame).",
   Value = true,
   Callback = function(v) F.Hitbox = v end,
 })
@@ -274,16 +281,33 @@ TabJogo:Slider({
   Callback = function(v) F.HitboxMult = tonumber(v) or 3 end,
 })
 TabJogo:Toggle({
+  Title = "Hitbox dinâmica",
+  Desc = "Cresce 60% extra quando a bola vem rápido na sua direção.",
+  Value = true,
+  Callback = function(v) F.HitboxDinamica = v end,
+})
+TabJogo:Toggle({
   Title = "Compensar ping",
   Desc = "Soma um bônus baseado na sua latência.",
   Value = true,
   Callback = function(v) F.PingComp = v end,
 })
+TabJogo:Toggle({
+  Title = "Imã de bola",
+  Desc = "Puxa a bola na sua direção quando ela chega perto (experimental).",
+  Value = false,
+  Callback = function(v) F.ImaBola = v end,
+})
+TabJogo:Slider({
+  Title = "Distância do imã",
+  Value = { Min = 6, Max = 30, Default = 14 },
+  Callback = function(v) F.ImaDist = tonumber(v) or 14 end,
+})
 
-TabJogo:Section({ Title = "Automação de jogadas" })
+TabJogo:Section({ Title = "Reação automática (previsão de trajetória)" })
 TabJogo:Toggle({
   Title = "Auto recepção",
-  Desc = "Clica sozinho quando um ataque adversário chega em você.",
+  Desc = "Defende sozinho ataques adversários, com previsão da bola.",
   Value = false,
   Callback = function(v) F.AutoRecepcao = v end,
 })
@@ -292,6 +316,37 @@ TabJogo:Toggle({
   Desc = "Corta sozinho quando você pula após levantamento do time.",
   Value = false,
   Callback = function(v) F.AutoAtaque = v end,
+})
+TabJogo:Slider({
+  Title = "Janela de reação (ms)",
+  Desc = "Menor = mais cedo o clique. 30 ms é um bom começo.",
+  Value = { Min = 0, Max = 150, Default = 30 },
+  Callback = function(v) F.ReacaoMs = tonumber(v) or 30 end,
+})
+
+TabJogo:Section({ Title = "Saque" })
+TabJogo:Toggle({
+  Title = "Auto saque perfeito",
+  Desc = "Detecta seu saque, mira pro lado adversário e saca sozinho na força ideal.",
+  Value = false,
+  Callback = function(v) F.AutoSaque = v end,
+})
+TabJogo:Slider({
+  Title = "Força do saque (%)",
+  Desc = "100 = força total. Se a bola sair pra fora, baixe para 90~95.",
+  Value = { Min = 50, Max = 100, Default = 100 },
+  Callback = function(v) F.SaqueForca = tonumber(v) or 100 end,
+})
+TabJogo:Toggle({
+  Title = "Saque manual perfeito",
+  Desc = "Quando VOCÊ saca, a força é corrigida automaticamente.",
+  Value = true,
+  Callback = function(v) F.SaquePerfeito = v end,
+})
+TabJogo:Button({
+  Title = "Sacar perfeito AGORA (teste)",
+  Desc = "Mira e saca imediatamente. Use quando for seu saque.",
+  Callback = function() _G.KoalaSacarAgora = true end,
 })
 
 TabJogo:Section({ Title = "Assistências (hooks)" })
@@ -318,12 +373,6 @@ TabJogo:Toggle({
   Desc = "Ajusta a carga do Bump/Set na criação da hitbox.",
   Value = false,
   Callback = function(v) F.RecepcaoPerfeita = v end,
-})
-TabJogo:Toggle({
-  Title = "Saque perfeito",
-  Desc = "Força força máxima em todo saque.",
-  Value = false,
-  Callback = function(v) F.SaquePerfeito = v end,
 })
 
 -----------------------------------------------------------
@@ -534,71 +583,30 @@ local parStatus = TabStatus:Paragraph({ Title = "Jogador", Desc = "Carregando...
 local parJogo   = TabStatus:Paragraph({ Title = "Partida", Desc = "Carregando..." })
 TabStatus:Section({ Title = "Sobre" })
 TabStatus:Paragraph({
-  Title = "Koala Vôlei v2",
-  Desc = "Hitbox e auto-jogadas mexem com a detecção de toque da bola. Comece com multiplicador baixo (2~3) para não chamar atenção.",
+  Title = "Koala Vôlei v3",
+  Desc = "Reação por previsão de trajetória + hitbox dinâmica. Comece com multiplicador 2~3 e janela de 30 ms para não chamar atenção.",
 })
 
 --============================================================================--
--- 7) Hitbox — loop por frame (o jogo reseta o tamanho; a gente vence na marra)
+-- 7) Núcleo de reação rápida (compartilhado entre toque e previsão)
 --============================================================================--
-local tamanhoOriginal = {}
-RunService.RenderStepped:Connect(function()
-  if not (F.Hitbox or F.AutoRecepcao or F.AutoAtaque) then return end
-  local bola, part = Estado.bola, Estado.bolaPart
-  if not (bola and bola.Parent and part) then return end
-  local hb = bola:FindFirstChild("HitBox")
-  if not hb then
-    local ok, novo = pcall(function()
-      local p = Instance.new("Part")
-      p.Name = "HitBox"
-      p.Shape = Enum.PartType.Ball
-      p.Anchored = true
-      p.CanCollide = false
-      p.CanTouch = true
-      p.Transparency = 1
-      p:SetAttribute("Koala", true)
-      p.CFrame = part.CFrame
-      p.Parent = bola
-      return p
-    end)
-    if ok then hb = novo end
-  end
-  if not hb then return end
-  if not tamanhoOriginal[hb] then
-    tamanhoOriginal[hb] = part.Size
-  end
-  if F.Hitbox or hb:GetAttribute("Koala") then
-    local extra = 0
-    if F.PingComp then extra = math.max(0, math.floor((pingMs() - 50) / 50)) end
-    local mult = (F.Hitbox and F.HitboxMult or 1) + extra
-    pcall(function()
-      hb.Size = tamanhoOriginal[hb] * mult
-      if hb:GetAttribute("Koala") then hb.CFrame = part.CFrame end
-    end)
-  elseif tamanhoOriginal[hb] and hb.Size ~= tamanhoOriginal[hb] then
-    pcall(function() hb.Size = tamanhoOriginal[hb] end)
-  end
-end)
-
---============================================================================--
--- 8) Auto recepção / ataque — toque na HitBox + simulação de input
---============================================================================--
-local ATAQUES  = { Spike = true, JumpSet = true, Block = true }
+local ATAQUES   = { Spike = true, JumpSet = true, Block = true }
 local RECEBIDAS = { Dive = true, Bump = true, Set = true }
+local ultimoGolpe = 0
 
 local function simularClique()
   pcall(function()
     local vp = Camera.ViewportSize
     local x, y = math.floor(vp.X / 2), math.floor(vp.Y / 2)
     VIM:SendMouseButtonEvent(x, y, 0, true, game, 1)
-    task.wait(0.05)
+    task.wait(0.02)
     VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
   end)
 end
 local function apertarQ()
   pcall(function()
     VIM:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
-    task.wait(0.05)
+    task.wait(0.02)
     VIM:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
   end)
 end
@@ -606,45 +614,32 @@ local function executarGolpe()
   if meuEstilo() == "TeamCaptain" then apertarQ() else simularClique() end
 end
 
-local toquePendente = false
-RS:GetAttributeChangedSignal("LastHitter"):Connect(function() toquePendente = false end)
-
-local function aoTocarHitbox(parte)
-  if toquePendente then return end
-  if not (F.AutoRecepcao or F.AutoAtaque) then return end
-  local char = LP.Character
-  if not (char and parte and parte:IsDescendantOf(char)) then return end
-  local part = Estado.bolaPart
-  if not part then return end
-  local hrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
-  if not hrp then return end
-
-  local defesa = F.AutoRecepcao
+local function condicaoDefesa()
+  return F.AutoRecepcao
     and Estado.ultimoTime ~= meuTime()
-    and ATAQUES[Estado.ultimoTipo]
-    and part.Position.Y >= hrp.Position.Y
-  local ataque = F.AutoAtaque
-    and noAr()
+    and ATAQUES[Estado.ultimoTipo] == true
+end
+local function condicaoAtaque()
+  return F.AutoAtaque
     and Estado.ultimoTime == meuTime()
     and Estado.ultimoBatedor ~= LP.Name
-    and (ATAQUES[Estado.ultimoTipo] or RECEBIDAS[Estado.ultimoTipo])
+    and (ATAQUES[Estado.ultimoTipo] or RECEBIDAS[Estado.ultimoTipo]) == true
+end
 
-  if not (defesa or ataque) then return end
-  toquePendente = true
-  task.spawn(function()
-    local limite = (math.floor(hrp.Position.Z) < 0) and -0.5 or 0.5
-    local t0 = tick()
-    while tick() - t0 < 1.5 do
-      local p = Estado.bolaPart
-      if not p then break end
-      local z = p.Position.Z
-      if (limite < 0 and z < limite) or (limite > 0 and z > limite) then break end
-      task.wait()
-    end
+local function tentarGolpear()
+  local agora = tick()
+  if agora - ultimoGolpe < 0.2 then return end
+  if condicaoDefesa() or (condicaoAtaque() and noAr()) then
+    ultimoGolpe = agora
     executarGolpe()
-    task.wait(0.3)
-    toquePendente = false
-  end)
+  end
+end
+
+-- Toque físico na hitbox = reação instantânea (sem esperar cruzar a rede)
+local function aoTocarHitbox(parte)
+  local char = LP.Character
+  if not (char and parte and parte:IsDescendantOf(char)) then return end
+  tentarGolpear()
 end
 
 local conexaoToque
@@ -664,7 +659,207 @@ Workspace.ChildAdded:Connect(function(f)
 end)
 
 --============================================================================--
--- 9) Hooks de remote (por instância, preservando Key do jogo)
+-- 8) Loop único por frame: hitbox + imã + previsão de trajetória
+--============================================================================--
+local tamanhoOriginal = {}
+RunService.RenderStepped:Connect(function(dt)
+  local bola, part = Estado.bola, Estado.bolaPart
+  if not (bola and bola.Parent and part and part.Parent) then return end
+  local char = LP.Character
+  local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+  ---------- HITBOX ----------
+  local hb = bola:FindFirstChild("HitBox")
+  if not hb and (F.Hitbox or F.AutoRecepcao or F.AutoAtaque) then
+    local ok, novo = pcall(function()
+      local p = Instance.new("Part")
+      p.Name = "HitBox"
+      p.Shape = Enum.PartType.Ball
+      p.Anchored = true
+      p.CanCollide = false
+      p.CanTouch = true
+      p.Transparency = 1
+      p:SetAttribute("Koala", true)
+      p.CFrame = part.CFrame
+      p.Parent = bola
+      return p
+    end)
+    if ok then hb = novo end
+  end
+  if hb then
+    if not tamanhoOriginal[hb] then tamanhoOriginal[hb] = part.Size end
+    local vel = part.AssemblyLinearVelocity
+    local aprox = false
+    if hrp then
+      local paraMim = hrp.Position - part.Position
+      local dist = paraMim.Magnitude
+      aprox = dist > 0.001 and vel:Dot(paraMim / dist) > 20
+    end
+    local mult = F.Hitbox and F.HitboxMult or 1
+    if F.HitboxDinamica and aprox then mult = mult * 1.6 end
+    if F.PingComp then mult = mult + math.max(0, math.floor((pingMs() - 50) / 50)) end
+    if F.Hitbox or hb:GetAttribute("Koala") then
+      pcall(function()
+        hb.Size = tamanhoOriginal[hb] * mult
+        if hb:GetAttribute("Koala") then hb.CFrame = part.CFrame end
+      end)
+      Estado.hitboxRaio = (tamanhoOriginal[hb].X * mult) / 2
+    elseif hb.Size ~= tamanhoOriginal[hb] then
+      pcall(function() hb.Size = tamanhoOriginal[hb] end)
+      Estado.hitboxRaio = tamanhoOriginal[hb].X / 2
+    end
+  end
+
+  if not hrp then return end
+  local posBola = part.Position
+  local posMim = hrp.Position
+
+  ---------- IMÃ DE BOLA ----------
+  if F.ImaBola and Estado.emJogo then
+    local paraMim = (posMim + Vector3.new(0, 2, 0)) - posBola
+    local dist = paraMim.Magnitude
+    if dist > 2 and dist < F.ImaDist then
+      local vel = part.AssemblyLinearVelocity
+      local vindo = vel.Magnitude < 5 or vel:Dot(paraMim / dist) > 0
+      if vindo then
+        local passo = math.clamp(45 * dt / dist, 0, 0.5)
+        local nova = posBola:Lerp(posMim + Vector3.new(0, 2, 0), passo)
+        pcall(function()
+          bola:PivotTo(CFrame.new(nova) * (part.CFrame - posBola))
+        end)
+      end
+    end
+  end
+
+  ---------- PREVISÃO DE TRAJETÓRIA (reação rápida) ----------
+  if F.AutoRecepcao or F.AutoAtaque then
+    if tick() - ultimoGolpe >= 0.2 then
+      local paraMim = posMim - posBola
+      local dist = paraMim.Magnitude
+      if dist <= 60 then
+        local vel = part.AssemblyLinearVelocity
+        local velAprox = dist > 0.001 and vel:Dot(paraMim / dist) or 0
+        local raio = Estado.hitboxRaio + 1.5
+        local janela = (F.ReacaoMs / 1000) + (pingMs() / 2000)
+        local iminente = dist <= raio
+          or (velAprox > 5 and ((dist - raio) / velAprox) <= janela)
+        if iminente then tentarGolpear() end
+      end
+    end
+  end
+end)
+
+--============================================================================--
+-- 9) Saque perfeito (mira automática + força ideal)
+--============================================================================--
+local function mirarQuadraAdversaria()
+  local char = LP.Character
+  local hrp = char and char:FindFirstChild("HumanoidRootPart")
+  if not hrp then return nil end
+  -- a rede fica em Z = 0; mirar reto para o lado adversário, levemente ao centro
+  local alvoZ = (hrp.Position.Z < 0) and 25 or -25
+  local alvo = Vector3.new(0, hrp.Position.Y, alvoZ)
+  pcall(function()
+    hrp.CFrame = CFrame.lookAt(hrp.Position, alvo)
+  end)
+  pcall(function()
+    Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, Vector3.new(0, hrp.Position.Y + 2, alvoZ))
+  end)
+  return alvo
+end
+
+local saqueEmAndamento = false
+local function sacarPerfeito()
+  if saqueEmAndamento then return end
+  saqueEmAndamento = true
+  task.spawn(function()
+    mirarQuadraAdversaria()
+    task.wait(0.08)
+    if not Estado.bola then
+      invocar(R.SpawnServeBall)
+      task.wait(0.15)
+    end
+    mirarQuadraAdversaria()
+    invocar(R.Serve, 1, F.SaqueForca / 100)
+    task.wait(1.5)
+    saqueEmAndamento = false
+  end)
+end
+
+-- botão manual usa flag (callback de UI roda em outro thread)
+task.spawn(function()
+  while true do
+    task.wait(0.1)
+    if _G.KoalaSacarAgora then
+      _G.KoalaSacarAgora = false
+      sacarPerfeito()
+    end
+  end
+end)
+
+-- detecção do momento de saque: UI de saque visível ou atributo de saque
+local serveUIs = {}
+local function cachearServeUI()
+  table.clear(serveUIs)
+  local pg = LP:FindFirstChild("PlayerGui")
+  if not pg then return end
+  for _, d in ipairs(pg:GetDescendants()) do
+    if d:IsA("GuiObject") and d.Name:lower():find("serve") then
+      table.insert(serveUIs, d)
+    end
+  end
+end
+local function cadeiaVisivel(ui)
+  local p = ui
+  while p and p ~= game do
+    if p:IsA("GuiObject") and not p.Visible then return false end
+    p = p.Parent
+  end
+  return true
+end
+local function serveAtivo()
+  for _, ui in ipairs(serveUIs) do
+    if ui.Visible and cadeiaVisivel(ui) then return true end
+  end
+  for k, v in pairs(RS:GetAttributes()) do
+    local kl = k:lower()
+    if kl:find("serv") and not kl:find("server") then
+      if v == true or tostring(v) == LP.Name then return true end
+    end
+  end
+  return false
+end
+
+task.spawn(function()
+  task.wait(3)
+  cachearServeUI()
+  local recache = 0
+  local estavaAtivo = false
+  while true do
+    task.wait(0.15)
+    recache = recache + 1
+    if recache >= 40 then
+      recache = 0
+      pcall(cachearServeUI)
+    end
+    if F.AutoSaque then
+      local ativo = false
+      pcall(function() ativo = serveAtivo() end)
+      if ativo and not estavaAtivo then
+        estavaAtivo = true
+        task.wait(0.1)
+        sacarPerfeito()
+      elseif not ativo then
+        estavaAtivo = false
+      end
+    else
+      estavaAtivo = false
+    end
+  end
+end)
+
+--============================================================================--
+-- 10) Hooks de remote (por instância, preservando Key do jogo)
 --============================================================================--
 local hooksOk = false
 if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
@@ -678,8 +873,9 @@ if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "functi
       end
       local args = { ... }
 
+      -- Saque manual com força corrigida
       if self == R.Serve and F.SaquePerfeito then
-        return velho(self, args[1], 1)
+        return velho(self, args[1], F.SaqueForca / 100)
       end
 
       if self == R.Interact and type(args[1]) == "table" then
@@ -718,7 +914,7 @@ if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "functi
 end
 
 --============================================================================--
--- 10) Loops de física / spins / claim / status
+-- 11) Loops de física / spins / claim / status
 --============================================================================--
 task.spawn(function() -- speed + pulo
   while true do
@@ -807,13 +1003,12 @@ task.spawn(function() -- status ao vivo
 end)
 
 --============================================================================--
--- 11) ESP
+-- 12) ESP
 --============================================================================--
 local espBolaHL, espBolaTag
 task.spawn(function()
   while true do
     task.wait(0.4)
-    -- bola
     if F.ESPBola and Estado.bola and Estado.bolaPart then
       if not espBolaHL or espBolaHL.Parent ~= Estado.bola then
         pcall(function() if espBolaHL then espBolaHL:Destroy() end end)
@@ -848,7 +1043,6 @@ task.spawn(function()
       pcall(function() if espBolaHL then espBolaHL:Destroy() espBolaHL = nil end end)
       pcall(function() if espBolaTag then espBolaTag:Destroy() espBolaTag = nil end end)
     end
-    -- jogadores
     for _, p in ipairs(Players:GetPlayers()) do
       if p ~= LP then
         local char = p.Character
@@ -870,7 +1064,7 @@ task.spawn(function()
 end)
 
 --============================================================================--
--- 12) Extras: advanced moves automático + anti-AFK
+-- 13) Extras: advanced moves automático + anti-AFK
 --============================================================================--
 task.spawn(function()
   pcall(function()
@@ -898,8 +1092,8 @@ end)
 
 task.defer(function()
   if hooksOk then
-    aviso("Koala Vôlei v2", "Carregado! RightControl abre/fecha o menu.", 5)
+    aviso("Koala Vôlei v3", "Carregado! RightControl abre/fecha o menu.", 5)
   else
-    aviso("Koala Vôlei v2", "Carregado (hooks indisponíveis — assistências desligadas).", 6)
+    aviso("Koala Vôlei v3", "Carregado (hooks indisponíveis — assistências desligadas).", 6)
   end
 end)
