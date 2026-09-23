@@ -1,12 +1,15 @@
 --[[
-  KoalaVolei.lua — v3
+  KoalaVolei.lua — v4
   Script para [UPD] Lendas do Vôlei / Volleyball Legends (PlaceId 73956553001240)
   Parte do Koala Hub — discord.gg/ZRFffEgQQM
 
-  v3: reação por PREVISÃO DE TRAJETÓRIA (defesa/ataque/toque quase instantâneos),
-      hitbox dinâmica (cresce com bola rápida) + imã de bola,
-      AUTO SAQUE PERFEITO (mira pro lado adversário e saca sozinho na força ideal),
-      loop único otimizado por frame, polyfills de executor, UI com retry + espelhos.
+  v4: hitbox VISÍVEL e reforçada (CanTouch forçado, limpeza ao desligar),
+      TRAJETÓRIA da bola desenhada (linha + marcador de aterrissagem),
+      MIRA dos jogadores (linhas de visada),
+      SUPER CORTE (carga máx + mergulho pra baixo = mais força dentro da quadra),
+      AUTO JOGAR partida (recepção + ataque + saque + seguir bola + pular),
+      correção: defesa de SAQUE agora funciona (Serve entrou na lista de ataques),
+      reação por previsão de trajetória, imã de bola, auto saque perfeito.
 
   ATENÇÃO: uso por sua conta e risco.
 ]]
@@ -156,6 +159,8 @@ local Estado = {
   emJogo = false, ultimoBatedor = "", ultimoTipo = "",
   sequencia = 0, ultimoTime = "", hitboxRaio = 3,
 }
+local tamanhoOriginal = {}
+
 local function varrerBola()
   for _, m in ipairs(Workspace:GetChildren()) do
     if m.Name:find("CLIENT_BALL") then return m end
@@ -166,6 +171,7 @@ local function definirBola(m)
   Estado.bola = m
   Estado.bolaPart = nil
   Estado.bolaId = nil
+  table.clear(tamanhoOriginal)
   if not m then return end
   task.spawn(function()
     Estado.bolaId = m:GetAttribute("Id")
@@ -200,11 +206,17 @@ local function meuEstilo()
   local s = LP:GetAttribute("Gameplay_Style") or ""
   return (s:gsub("%d", ""))
 end
+local function meuHRP()
+  local char = LP.Character
+  return char and char:FindFirstChild("HumanoidRootPart")
+end
+local function meuHum()
+  local char = LP.Character
+  return char and char:FindFirstChildOfClass("Humanoid")
+end
 local function noAr()
-  local ok, ar = pcall(function()
-    return LP.Character and LP.Character:FindFirstChildOfClass("Humanoid").FloorMaterial == Enum.Material.Air
-  end)
-  return ok and ar or false
+  local hum = meuHum()
+  return hum and hum.FloorMaterial == Enum.Material.Air or false
 end
 local function pingMs()
   local ok, v = pcall(function() return LP:GetNetworkPing() * 2000 end)
@@ -217,19 +229,24 @@ end
 local F = {
   -- hitbox
   Hitbox = true, HitboxMult = 3, PingComp = true, HitboxDinamica = true,
+  MostrarHitbox = false,
   ImaBola = false, ImaDist = 14,
   -- reação
   ReacaoMs = 30,
-  AutoRecepcao = false, AutoAtaque = false,
+  AutoRecepcao = false, AutoAtaque = false, AutoPular = true,
+  -- auto jogar
+  AutoJogar = false, SeguirBola = false,
   -- hooks
   CorteNaMira = false, CargaMax = false, PasseFacil = false, RecepcaoPerfeita = false,
+  SuperCorte = false, SuperCorteForca = 35,
   -- saque
   SaquePerfeito = true, AutoSaque = false, SaqueForca = 100,
   -- spins / recompensas
   AutoEstilo = false, AlvoEstilo = "", AutoHab = false, AlvoHab = "", AutoClaim = false,
   -- física / visual
   Speed = false, SpeedVal = 16, Jump = false, JumpVal = 50, Noclip = false,
-  ESPBola = false, ESPJogadores = false, Fullbright = false,
+  ESPBola = false, ESPJogadores = false, Trajetoria = false, MiraJogadores = false,
+  Fullbright = false,
 }
 
 --============================================================================--
@@ -237,7 +254,7 @@ local F = {
 --============================================================================--
 local okWin, Window = pcall(function()
   return Koala:CreateWindow({
-    Title = "Koala Vôlei v3",
+    Title = "Koala Vôlei v4",
     Icon = "volleyball",
     Author = "discord.gg/ZRFffEgQQM",
     Folder = "KoalaVolei",
@@ -267,12 +284,39 @@ end
 -----------------------------------------------------------
 local TabJogo = Window:Tab({ Title = "Jogo", Icon = "volleyball" })
 
+TabJogo:Section({ Title = "★ Auto jogar" })
+TabJogo:Toggle({
+  Title = "AUTO JOGAR PARTIDA",
+  Desc = "Liga tudo junto: recepção + ataque + saque + seguir bola + pular.",
+  Value = false,
+  Callback = function(v)
+    F.AutoJogar = v
+    F.AutoRecepcao = v
+    F.AutoAtaque = v
+    F.AutoSaque = v
+    F.SeguirBola = v
+    aviso("Koala Vôlei", v and "AUTO JOGAR ligado. Segure o celular e assista." or "AUTO JOGAR desligado.")
+  end,
+})
+TabJogo:Toggle({
+  Title = "Seguir bola",
+  Desc = "Anda sozinho até o ponto onde a bola vai cair (sem sair do seu lado).",
+  Value = false,
+  Callback = function(v) F.SeguirBola = v end,
+})
+
 TabJogo:Section({ Title = "Hitbox da bola" })
 TabJogo:Toggle({
   Title = "Hitbox expandida",
   Desc = "Aumenta a zona de toque da bola (redimensionada a cada frame).",
   Value = true,
   Callback = function(v) F.Hitbox = v end,
+})
+TabJogo:Toggle({
+  Title = "MOSTRAR hitbox",
+  Desc = "Deixa a hitbox visível (roxa) para você ver o tamanho real.",
+  Value = false,
+  Callback = function(v) F.MostrarHitbox = v end,
 })
 TabJogo:Slider({
   Title = "Tamanho da hitbox",
@@ -307,19 +351,25 @@ TabJogo:Slider({
 TabJogo:Section({ Title = "Reação automática (previsão de trajetória)" })
 TabJogo:Toggle({
   Title = "Auto recepção",
-  Desc = "Defende sozinho ataques adversários, com previsão da bola.",
+  Desc = "Defende sozinho ataques e saques adversários.",
   Value = false,
   Callback = function(v) F.AutoRecepcao = v end,
 })
 TabJogo:Toggle({
   Title = "Auto ataque",
-  Desc = "Corta sozinho quando você pula após levantamento do time.",
+  Desc = "Corta sozinho quando você está no ar após levantamento do time.",
   Value = false,
   Callback = function(v) F.AutoAtaque = v end,
 })
+TabJogo:Toggle({
+  Title = "Auto pular",
+  Desc = "Pula sozinho na hora certa para cortar bolas altas.",
+  Value = true,
+  Callback = function(v) F.AutoPular = v end,
+})
 TabJogo:Slider({
   Title = "Janela de reação (ms)",
-  Desc = "Menor = mais cedo o clique. 30 ms é um bom começo.",
+  Desc = "Menor = clique mais em cima da hora. 30 ms é um bom começo.",
   Value = { Min = 0, Max = 150, Default = 30 },
   Callback = function(v) F.ReacaoMs = tonumber(v) or 30 end,
 })
@@ -327,7 +377,7 @@ TabJogo:Slider({
 TabJogo:Section({ Title = "Saque" })
 TabJogo:Toggle({
   Title = "Auto saque perfeito",
-  Desc = "Detecta seu saque, mira pro lado adversário e saca sozinho na força ideal.",
+  Desc = "Detecta seu saque, mira pro lado adversário e saca sozinho.",
   Value = false,
   Callback = function(v) F.AutoSaque = v end,
 })
@@ -350,6 +400,18 @@ TabJogo:Button({
 })
 
 TabJogo:Section({ Title = "Assistências (hooks)" })
+TabJogo:Toggle({
+  Title = "SUPER CORTE",
+  Desc = "Corte com carga máxima e mergulho pra baixo — mais forte e dentro da quadra.",
+  Value = false,
+  Callback = function(v) F.SuperCorte = v end,
+})
+TabJogo:Slider({
+  Title = "Mergulho do super corte (%)",
+  Desc = "Quanto o corte aponta pra baixo. 30~40 costuma ser ideal.",
+  Value = { Min = 0, Max = 80, Default = 35 },
+  Callback = function(v) F.SuperCorteForca = tonumber(v) or 35 end,
+})
 TabJogo:Toggle({
   Title = "Corte na mira",
   Desc = "O corte vai para onde a câmera aponta.",
@@ -528,9 +590,23 @@ TabMov:Toggle({ Title = "Noclip", Desc = "Atravessa paredes.", Value = false, Ca
 -----------------------------------------------------------
 local TabVis = Window:Tab({ Title = "Visual", Icon = "eye" })
 
+TabVis:Section({ Title = "Leitura de jogo" })
+TabVis:Toggle({
+  Title = "Trajetória da bola",
+  Desc = "Linha mostrando para onde a bola vai + marcador onde ela cai (vermelho = seu lado, verde = lado deles).",
+  Value = false,
+  Callback = function(v) F.Trajetoria = v end,
+})
+TabVis:Toggle({
+  Title = "Mira dos jogadores",
+  Desc = "Linhas mostrando para onde cada jogador está olhando.",
+  Value = false,
+  Callback = function(v) F.MiraJogadores = v end,
+})
+
 TabVis:Section({ Title = "ESP" })
 TabVis:Toggle({ Title = "ESP da bola", Desc = "Highlight + distância.", Value = false, Callback = function(v) F.ESPBola = v end })
-TabVis:Toggle({ Title = "ESP de jogadores", Desc = "Highlight + nome.", Value = false, Callback = function(v) F.ESPJogadores = v end })
+TabVis:Toggle({ Title = "ESP de jogadores", Desc = "Highlight colorido por time.", Value = false, Callback = function(v) F.ESPJogadores = v end })
 
 TabVis:Section({ Title = "Desempenho" })
 TabVis:Button({
@@ -583,16 +659,17 @@ local parStatus = TabStatus:Paragraph({ Title = "Jogador", Desc = "Carregando...
 local parJogo   = TabStatus:Paragraph({ Title = "Partida", Desc = "Carregando..." })
 TabStatus:Section({ Title = "Sobre" })
 TabStatus:Paragraph({
-  Title = "Koala Vôlei v3",
-  Desc = "Reação por previsão de trajetória + hitbox dinâmica. Comece com multiplicador 2~3 e janela de 30 ms para não chamar atenção.",
+  Title = "Koala Vôlei v4",
+  Desc = "Auto jogar + previsão de trajetória + hitbox visível. Em partida pública, use com moderação para não chamar atenção.",
 })
 
 --============================================================================--
--- 7) Núcleo de reação rápida (compartilhado entre toque e previsão)
+-- 7) Núcleo de reação rápida
 --============================================================================--
-local ATAQUES   = { Spike = true, JumpSet = true, Block = true }
+local ATAQUES   = { Spike = true, JumpSet = true, Block = true, Serve = true }
 local RECEBIDAS = { Dive = true, Bump = true, Set = true }
 local ultimoGolpe = 0
+local ultimoPulo = 0
 
 local function simularClique()
   pcall(function()
@@ -619,7 +696,7 @@ local function condicaoDefesa()
     and Estado.ultimoTime ~= meuTime()
     and ATAQUES[Estado.ultimoTipo] == true
 end
-local function condicaoAtaque()
+local function condicaoAtaqueBase()
   return F.AutoAtaque
     and Estado.ultimoTime == meuTime()
     and Estado.ultimoBatedor ~= LP.Name
@@ -629,13 +706,13 @@ end
 local function tentarGolpear()
   local agora = tick()
   if agora - ultimoGolpe < 0.2 then return end
-  if condicaoDefesa() or (condicaoAtaque() and noAr()) then
+  if condicaoDefesa() or (condicaoAtaqueBase() and noAr()) then
     ultimoGolpe = agora
     executarGolpe()
   end
 end
 
--- Toque físico na hitbox = reação instantânea (sem esperar cruzar a rede)
+-- Toque físico na hitbox = reação instantânea
 local function aoTocarHitbox(parte)
   local char = LP.Character
   if not (char and parte and parte:IsDescendantOf(char)) then return end
@@ -659,67 +736,196 @@ Workspace.ChildAdded:Connect(function(f)
 end)
 
 --============================================================================--
--- 8) Loop único por frame: hitbox + imã + previsão de trajetória
+-- 8) Previsão de trajetória (física de projétil)
 --============================================================================--
-local tamanhoOriginal = {}
+local function preverAterrissagem(p0, v0, chaoY)
+  local g = Workspace.Gravity
+  local a = -0.5 * g
+  local b = v0.Y
+  local c = p0.Y - chaoY
+  local disc = b * b - 4 * a * c
+  if disc < 0 then return nil end
+  local sq = math.sqrt(disc)
+  local t1 = (-b + sq) / (2 * a)
+  local t2 = (-b - sq) / (2 * a)
+  local t
+  if t1 > 0 and t2 > 0 then t = math.min(t1, t2)
+  elseif t1 > 0 then t = t1
+  elseif t2 > 0 then t = t2 end
+  if not t or t > 6 then return nil end
+  return p0 + Vector3.new(v0.X * t, v0.Y * t - 0.5 * g * t * t, v0.Z * t), t
+end
+
+--============================================================================--
+-- 9) Visuais de leitura de jogo (trajetória + marcador + mira)
+--============================================================================--
+local function novaParteVisual(nome, cor)
+  local p = Instance.new("Part")
+  p.Name = nome
+  p.Anchored = true
+  p.CanCollide = false
+  p.CanTouch = false
+  p.CanQuery = false
+  p.Material = Enum.Material.Neon
+  p.Color = cor
+  p.Transparency = 1
+  p.Parent = Workspace
+  return p
+end
+local trajLinha    = novaParteVisual("KoalaTrajLinha", Color3.fromRGB(255, 255, 0))
+local trajMarcador = novaParteVisual("KoalaTrajMarcador", Color3.fromRGB(0, 255, 120))
+trajMarcador.Shape = Enum.PartType.Cylinder
+
+local linhasMira = {}
+local function limparMiras()
+  for pl, part in pairs(linhasMira) do
+    pcall(function() part:Destroy() end)
+    linhasMira[pl] = nil
+  end
+end
+task.spawn(function() -- mira dos jogadores (10 Hz)
+  while true do
+    task.wait(0.12)
+    if not F.MiraJogadores then
+      if next(linhasMira) then limparMiras() end
+    else
+    for _, p in ipairs(Players:GetPlayers()) do
+      if p ~= LP then
+        local char = p.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+          local part = linhasMira[p]
+          if not part then
+            part = novaParteVisual("KoalaMira", Color3.new(1, 1, 1))
+            linhasMira[p] = part
+          end
+          local aliado = tostring(p.Team) == meuTime()
+          part.Color = aliado and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(255, 60, 60)
+          local origem = hrp.Position + Vector3.new(0, 1.5, 0)
+          local alvo = origem + hrp.CFrame.LookVector * 12
+          part.Size = Vector3.new(0.12, 0.12, 12)
+          part.CFrame = CFrame.lookAt((origem + alvo) / 2, alvo)
+          part.Transparency = 0.35
+        elseif linhasMira[p] then
+          pcall(function() linhasMira[p]:Destroy() end)
+          linhasMira[p] = nil
+        end
+      end
+    end
+    end
+  end
+end)
+Players.PlayerRemoving:Connect(function(p)
+  if linhasMira[p] then
+    pcall(function() linhasMira[p]:Destroy() end)
+    linhasMira[p] = nil
+  end
+end)
+
+--============================================================================--
+-- 10) Loop único por frame: hitbox + imã + previsão + trajetória + pulo
+--============================================================================--
 RunService.RenderStepped:Connect(function(dt)
   local bola, part = Estado.bola, Estado.bolaPart
-  if not (bola and bola.Parent and part and part.Parent) then return end
-  local char = LP.Character
-  local hrp = char and char:FindFirstChild("HumanoidRootPart")
+  local bolaOk = bola and bola.Parent and part and part.Parent
+  local hrp = meuHRP()
 
   ---------- HITBOX ----------
-  local hb = bola:FindFirstChild("HitBox")
-  if not hb and (F.Hitbox or F.AutoRecepcao or F.AutoAtaque) then
-    local ok, novo = pcall(function()
-      local p = Instance.new("Part")
-      p.Name = "HitBox"
-      p.Shape = Enum.PartType.Ball
-      p.Anchored = true
-      p.CanCollide = false
-      p.CanTouch = true
-      p.Transparency = 1
-      p:SetAttribute("Koala", true)
-      p.CFrame = part.CFrame
-      p.Parent = bola
-      return p
-    end)
-    if ok then hb = novo end
-  end
-  if hb then
-    if not tamanhoOriginal[hb] then tamanhoOriginal[hb] = part.Size end
-    local vel = part.AssemblyLinearVelocity
-    local aprox = false
-    if hrp then
-      local paraMim = hrp.Position - part.Position
-      local dist = paraMim.Magnitude
-      aprox = dist > 0.001 and vel:Dot(paraMim / dist) > 20
-    end
-    local mult = F.Hitbox and F.HitboxMult or 1
-    if F.HitboxDinamica and aprox then mult = mult * 1.6 end
-    if F.PingComp then mult = mult + math.max(0, math.floor((pingMs() - 50) / 50)) end
-    if F.Hitbox or hb:GetAttribute("Koala") then
-      pcall(function()
-        hb.Size = tamanhoOriginal[hb] * mult
-        if hb:GetAttribute("Koala") then hb.CFrame = part.CFrame end
+  if bolaOk then
+    local hb = bola:FindFirstChild("HitBox")
+    if not hb and (F.Hitbox or F.AutoRecepcao or F.AutoAtaque) then
+      local ok, novo = pcall(function()
+        local p = Instance.new("Part")
+        p.Name = "HitBox"
+        p.Shape = Enum.PartType.Ball
+        p.Anchored = true
+        p.CanCollide = false
+        p.CanTouch = true
+        p.Transparency = 1
+        p:SetAttribute("Koala", true)
+        p.CFrame = part.CFrame
+        p.Parent = bola
+        return p
       end)
-      Estado.hitboxRaio = (tamanhoOriginal[hb].X * mult) / 2
-    elseif hb.Size ~= tamanhoOriginal[hb] then
-      pcall(function() hb.Size = tamanhoOriginal[hb] end)
-      Estado.hitboxRaio = tamanhoOriginal[hb].X / 2
+      if ok then hb = novo end
+    end
+    if hb then
+      if not tamanhoOriginal[hb] then tamanhoOriginal[hb] = part.Size end
+      local gerenciando = F.Hitbox or hb:GetAttribute("Koala")
+      if gerenciando then
+        local vel = part.AssemblyLinearVelocity
+        local aprox = false
+        if hrp then
+          local paraMim = hrp.Position - part.Position
+          local dist = paraMim.Magnitude
+          aprox = dist > 0.001 and vel:Dot(paraMim / dist) > 20
+        end
+        local mult = F.Hitbox and F.HitboxMult or 1
+        if F.HitboxDinamica and aprox then mult = mult * 1.6 end
+        if F.PingComp then mult = mult + math.max(0, math.floor((pingMs() - 50) / 50)) end
+        pcall(function()
+          hb.Size = tamanhoOriginal[hb] * mult
+          hb.CanTouch = true
+          if hb:GetAttribute("Koala") then hb.CFrame = part.CFrame end
+          if F.MostrarHitbox then
+            hb.Transparency = 0.55
+            hb.Material = Enum.Material.ForceField
+            hb.Color = Color3.fromRGB(180, 0, 255)
+          else
+            hb.Transparency = 1
+          end
+        end)
+        Estado.hitboxRaio = (tamanhoOriginal[hb].X * mult) / 2
+      else
+        if hb.Size ~= tamanhoOriginal[hb] then
+          pcall(function() hb.Size = tamanhoOriginal[hb] hb.Transparency = 1 end)
+        end
+        Estado.hitboxRaio = tamanhoOriginal[hb].X / 2
+      end
     end
   end
 
-  if not hrp then return end
+  if not (bolaOk and hrp) then
+    if F.Trajetoria then
+      trajLinha.Transparency = 1
+      trajMarcador.Transparency = 1
+    end
+    return
+  end
+
   local posBola = part.Position
   local posMim = hrp.Position
+  local vel = part.AssemblyLinearVelocity
+
+  ---------- TRAJETÓRIA VISUAL ----------
+  if F.Trajetoria then
+    local chaoY = posMim.Y - 3
+    local pouso = preverAterrissagem(posBola, vel, chaoY)
+    if pouso then
+      local meio = (posBola + pouso) / 2
+      local comp = (pouso - posBola).Magnitude
+      trajLinha.Size = Vector3.new(0.15, 0.15, comp)
+      trajLinha.CFrame = CFrame.lookAt(meio, pouso)
+      trajLinha.Transparency = 0.25
+      trajLinha.Color = Color3.fromRGB(255, 255, 0)
+      local meuLado = posMim.Z < 0
+      local pousoMeuLado = pouso.Z < 0
+      local perigo = (pousoMeuLado == meuLado)
+      trajMarcador.Color = perigo and Color3.fromRGB(255, 50, 50) or Color3.fromRGB(0, 255, 120)
+      trajMarcador.Size = Vector3.new(0.25, 5, 5)
+      trajMarcador.CFrame = CFrame.new(pouso + Vector3.new(0, 0.2, 0)) * CFrame.Angles(0, 0, math.rad(90))
+      trajMarcador.Transparency = 0.35
+    else
+      trajLinha.Transparency = 1
+      trajMarcador.Transparency = 1
+    end
+  end
 
   ---------- IMÃ DE BOLA ----------
   if F.ImaBola and Estado.emJogo then
     local paraMim = (posMim + Vector3.new(0, 2, 0)) - posBola
     local dist = paraMim.Magnitude
     if dist > 2 and dist < F.ImaDist then
-      local vel = part.AssemblyLinearVelocity
       local vindo = vel.Magnitude < 5 or vel:Dot(paraMim / dist) > 0
       if vindo then
         local passo = math.clamp(45 * dt / dist, 0, 0.5)
@@ -731,32 +937,71 @@ RunService.RenderStepped:Connect(function(dt)
     end
   end
 
-  ---------- PREVISÃO DE TRAJETÓRIA (reação rápida) ----------
+  ---------- PREVISÃO + REAÇÃO ----------
   if F.AutoRecepcao or F.AutoAtaque then
-    if tick() - ultimoGolpe >= 0.2 then
+    local agora = tick()
+    if agora - ultimoGolpe >= 0.2 then
       local paraMim = posMim - posBola
       local dist = paraMim.Magnitude
       if dist <= 60 then
-        local vel = part.AssemblyLinearVelocity
         local velAprox = dist > 0.001 and vel:Dot(paraMim / dist) or 0
         local raio = Estado.hitboxRaio + 1.5
         local janela = (F.ReacaoMs / 1000) + (pingMs() / 2000)
         local iminente = dist <= raio
           or (velAprox > 5 and ((dist - raio) / velAprox) <= janela)
         if iminente then tentarGolpear() end
+
+        -- AUTO PULAR: bola alta chegando e contexto de ataque
+        if F.AutoPular and condicaoAtaqueBase() and not noAr() then
+          if agora - ultimoPulo >= 0.9 then
+            local distH = (Vector3.new(posBola.X, 0, posBola.Z) - Vector3.new(posMim.X, 0, posMim.Z)).Magnitude
+            local altura = posBola.Y - posMim.Y
+            if distH <= raio + 5 and altura >= 2.5 and altura <= 12 then
+              local hum = meuHum()
+              if hum then
+                ultimoPulo = agora
+                hum.Jump = true
+              end
+            end
+          end
+        end
       end
     end
   end
 end)
 
 --============================================================================--
--- 9) Saque perfeito (mira automática + força ideal)
+-- 11) Seguir bola (auto posicionamento)
+--============================================================================--
+task.spawn(function()
+  while true do
+    task.wait(0.15)
+    if F.SeguirBola and Estado.emJogo then
+      pcall(function()
+        local hum = meuHum()
+        local hrp = meuHRP()
+        local part = Estado.bolaPart
+        if not (hum and hrp and part) then return end
+        local chaoY = hrp.Position.Y - 3
+        local pouso = preverAterrissagem(part.Position, part.AssemblyLinearVelocity, chaoY) or part.Position
+        local ladoNeg = hrp.Position.Z < 0
+        local alvoZ = pouso.Z
+        if ladoNeg then alvoZ = math.min(alvoZ, -2.5) else alvoZ = math.max(alvoZ, 2.5) end
+        local alvo = Vector3.new(pouso.X, hrp.Position.Y, alvoZ)
+        if (alvo - hrp.Position).Magnitude > 2 then
+          hum:MoveTo(alvo)
+        end
+      end)
+    end
+  end
+end)
+
+--============================================================================--
+-- 12) Saque perfeito (mira automática + força ideal)
 --============================================================================--
 local function mirarQuadraAdversaria()
-  local char = LP.Character
-  local hrp = char and char:FindFirstChild("HumanoidRootPart")
+  local hrp = meuHRP()
   if not hrp then return nil end
-  -- a rede fica em Z = 0; mirar reto para o lado adversário, levemente ao centro
   local alvoZ = (hrp.Position.Z < 0) and 25 or -25
   local alvo = Vector3.new(0, hrp.Position.Y, alvoZ)
   pcall(function()
@@ -786,7 +1031,6 @@ local function sacarPerfeito()
   end)
 end
 
--- botão manual usa flag (callback de UI roda em outro thread)
 task.spawn(function()
   while true do
     task.wait(0.1)
@@ -797,7 +1041,6 @@ task.spawn(function()
   end
 end)
 
--- detecção do momento de saque: UI de saque visível ou atributo de saque
 local serveUIs = {}
 local function cachearServeUI()
   table.clear(serveUIs)
@@ -859,7 +1102,7 @@ task.spawn(function()
 end)
 
 --============================================================================--
--- 10) Hooks de remote (por instância, preservando Key do jogo)
+-- 13) Hooks de remote (por instância, preservando Key do jogo)
 --============================================================================--
 local hooksOk = false
 if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "function" then
@@ -881,13 +1124,24 @@ if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "functi
       if self == R.Interact and type(args[1]) == "table" then
         local d = args[1]
         if d.Move == "Spike" then
-          if F.CargaMax then
+          if F.SuperCorte and Camera then
+            local lv = Camera.CFrame.LookVector
+            local mergulho = Vector3.new(0, -F.SuperCorteForca / 100, 0)
+            local dir = (lv + mergulho).Unit
+            d.LookVector = dir
+            d.TiltDirection = dir
             d.Charge = 1
             d.SpecialCharge = 1
             d.ClientCanRunSpecial = true
-          end
-          if F.CorteNaMira and Camera then
-            d.LookVector = Camera.CFrame.LookVector
+          else
+            if F.CargaMax then
+              d.Charge = 1
+              d.SpecialCharge = 1
+              d.ClientCanRunSpecial = true
+            end
+            if F.CorteNaMira and Camera then
+              d.LookVector = Camera.CFrame.LookVector
+            end
           end
         elseif (d.Move == "Bump" or d.Move == "Set") and F.PasseFacil then
           d.Charge = (d.Move == "Bump") and 0 or 1
@@ -914,13 +1168,13 @@ if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "functi
 end
 
 --============================================================================--
--- 11) Loops de física / spins / claim / status
+-- 14) Loops de física / spins / claim / status
 --============================================================================--
-task.spawn(function() -- speed + pulo
+task.spawn(function() -- speed + pulo forte
   while true do
     task.wait(0.25)
     pcall(function()
-      local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+      local hum = meuHum()
       if not hum then return end
       if F.Speed and hum.WalkSpeed ~= F.SpeedVal then hum.WalkSpeed = F.SpeedVal end
       if F.Jump then
@@ -1003,7 +1257,7 @@ task.spawn(function() -- status ao vivo
 end)
 
 --============================================================================--
--- 12) ESP
+-- 15) ESP
 --============================================================================--
 local espBolaHL, espBolaTag
 task.spawn(function()
@@ -1034,7 +1288,7 @@ task.spawn(function()
         espBolaTag.Parent = Estado.bola
       end
       pcall(function()
-        local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        local hrp = meuHRP()
         if hrp then
           espBolaTag.Txt.Text = string.format("BOLA • %dm", math.floor((Estado.bolaPart.Position - hrp.Position).Magnitude))
         end
@@ -1064,7 +1318,7 @@ task.spawn(function()
 end)
 
 --============================================================================--
--- 13) Extras: advanced moves automático + anti-AFK
+-- 16) Extras: advanced moves automático + anti-AFK
 --============================================================================--
 task.spawn(function()
   pcall(function()
@@ -1092,8 +1346,8 @@ end)
 
 task.defer(function()
   if hooksOk then
-    aviso("Koala Vôlei v3", "Carregado! RightControl abre/fecha o menu.", 5)
+    aviso("Koala Vôlei v4", "Carregado! RightControl abre/fecha o menu.", 5)
   else
-    aviso("Koala Vôlei v3", "Carregado (hooks indisponíveis — assistências desligadas).", 6)
+    aviso("Koala Vôlei v4", "Carregado (hooks indisponíveis — assistências desligadas).", 6)
   end
 end)
