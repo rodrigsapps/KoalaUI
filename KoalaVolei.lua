@@ -1,15 +1,17 @@
 --[[
-  KoalaVolei.lua — v4
+  KoalaVolei.lua — v5
   Script para [UPD] Lendas do Vôlei / Volleyball Legends (PlaceId 73956553001240)
   Parte do Koala Hub — discord.gg/ZRFffEgQQM
 
-  v4: hitbox VISÍVEL e reforçada (CanTouch forçado, limpeza ao desligar),
-      TRAJETÓRIA da bola desenhada (linha + marcador de aterrissagem),
-      MIRA dos jogadores (linhas de visada),
-      SUPER CORTE (carga máx + mergulho pra baixo = mais força dentro da quadra),
-      AUTO JOGAR partida (recepção + ataque + saque + seguir bola + pular),
-      correção: defesa de SAQUE agora funciona (Serve entrou na lista de ataques),
-      reação por previsão de trajetória, imã de bola, auto saque perfeito.
+  v5 (revisão de código):
+    FIX loops por frame protegidos com pcall (um erro não mata mais tudo em silêncio)
+    FIX auto saque não dispara por falso positivo (checa Enabled do ScreenGui)
+    FIX auto ataque conta o pulo do próprio script (janela de 0.45s após auto pular)
+    FIX câmera sempre atual (não quebra se o jogo recriar a câmera)
+    FIX reconecta o toque se a HitBox do jogo aparecer depois da bola
+    FIX previsão de queda protegida contra gravidade zero / NaN
+    FIX AUTO JOGAR agora também garante a hitbox ligada
+    OPT ping cacheado 2x/s (antes: 60x/s), estilo cacheado, alocações por frame reduzidas
 
   ATENÇÃO: uso por sua conta e risco.
 ]]
@@ -60,7 +62,10 @@ local Lighting   = game:GetService("Lighting")
 local VU         = game:GetService("VirtualUser")
 local VIM        = game:GetService("VirtualInputManager")
 local LP         = Players.LocalPlayer
-local Camera     = Workspace.CurrentCamera
+
+local function cam()
+  return Workspace.CurrentCamera
+end
 
 local function aviso(t, txt, dur)
   pcall(function()
@@ -161,27 +166,60 @@ local Estado = {
 }
 local tamanhoOriginal = {}
 
-local function varrerBola()
-  for _, m in ipairs(Workspace:GetChildren()) do
-    if m.Name:find("CLIENT_BALL") then return m end
+-- ping cacheado (2x/s)
+local pingCache = 60
+task.spawn(function()
+  while true do
+    task.wait(0.5)
+    local ok, v = pcall(function() return LP:GetNetworkPing() * 2000 end)
+    if ok and type(v) == "number" then pingCache = v end
   end
-  return nil
+end)
+local function pingMs() return pingCache end
+
+-- estilo cacheado (listener no atributo)
+local estiloCache = ""
+local function atualizarEstilo()
+  local s = LP:GetAttribute("Gameplay_Style") or ""
+  estiloCache = (s:gsub("%d", ""))
 end
+pcall(function()
+  atualizarEstilo()
+  LP:GetAttributeChangedSignal("Gameplay_Style"):Connect(atualizarEstilo)
+end)
+local function meuEstilo() return estiloCache end
+
+local conexaoToque
+local conexaoHBChild
+local function ligarToque(bola) -- forward declare (definida na seção 7)
+end
+
 local function definirBola(m)
   Estado.bola = m
   Estado.bolaPart = nil
   Estado.bolaId = nil
   table.clear(tamanhoOriginal)
+  if conexaoHBChild then pcall(function() conexaoHBChild:Disconnect() end) conexaoHBChild = nil end
   if not m then return end
+  -- se a HitBox do jogo aparecer depois, reconecta o toque
+  conexaoHBChild = m.ChildAdded:Connect(function(f)
+    if f.Name == "HitBox" then ligarToque(m) end
+  end)
   task.spawn(function()
     Estado.bolaId = m:GetAttribute("Id")
     m.PrimaryPart = m.PrimaryPart or m:WaitForChild("Ball.1", 3) or m:FindFirstChildWhichIsA("BasePart", true)
     Estado.bolaPart = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart", true)
   end)
 end
+local function varrerBola()
+  for _, m in ipairs(Workspace:GetChildren()) do
+    if m.Name:find("CLIENT_BALL") then return m end
+  end
+  return nil
+end
 definirBola(varrerBola())
 Workspace.ChildAdded:Connect(function(f)
-  if f.Name:find("CLIENT_BALL") then definirBola(f) end
+  if f.Name:find("CLIENT_BALL") then definirBola(f) ligarToque(f) end
 end)
 Workspace.ChildRemoved:Connect(function(f)
   if f == Estado.bola then definirBola(varrerBola()) end
@@ -202,10 +240,6 @@ ligarAttr(RS, "TeamHitStreak", "sequencia", 0)
 ligarAttr(RS, "LastHitTeam", "ultimoTime", "")
 
 local function meuTime() return tostring(LP.Team) end
-local function meuEstilo()
-  local s = LP:GetAttribute("Gameplay_Style") or ""
-  return (s:gsub("%d", ""))
-end
 local function meuHRP()
   local char = LP.Character
   return char and char:FindFirstChild("HumanoidRootPart")
@@ -217,10 +251,6 @@ end
 local function noAr()
   local hum = meuHum()
   return hum and hum.FloorMaterial == Enum.Material.Air or false
-end
-local function pingMs()
-  local ok, v = pcall(function() return LP:GetNetworkPing() * 2000 end)
-  return (ok and type(v) == "number") and v or 60
 end
 
 --============================================================================--
@@ -254,7 +284,7 @@ local F = {
 --============================================================================--
 local okWin, Window = pcall(function()
   return Koala:CreateWindow({
-    Title = "Koala Vôlei v4",
+    Title = "Koala Vôlei v5",
     Icon = "volleyball",
     Author = "discord.gg/ZRFffEgQQM",
     Folder = "KoalaVolei",
@@ -287,7 +317,7 @@ local TabJogo = Window:Tab({ Title = "Jogo", Icon = "volleyball" })
 TabJogo:Section({ Title = "★ Auto jogar" })
 TabJogo:Toggle({
   Title = "AUTO JOGAR PARTIDA",
-  Desc = "Liga tudo junto: recepção + ataque + saque + seguir bola + pular.",
+  Desc = "Liga tudo junto: recepção + ataque + saque + seguir bola + pular + hitbox.",
   Value = false,
   Callback = function(v)
     F.AutoJogar = v
@@ -295,6 +325,7 @@ TabJogo:Toggle({
     F.AutoAtaque = v
     F.AutoSaque = v
     F.SeguirBola = v
+    if v then F.Hitbox = true end
     aviso("Koala Vôlei", v and "AUTO JOGAR ligado. Segure o celular e assista." or "AUTO JOGAR desligado.")
   end,
 })
@@ -659,8 +690,8 @@ local parStatus = TabStatus:Paragraph({ Title = "Jogador", Desc = "Carregando...
 local parJogo   = TabStatus:Paragraph({ Title = "Partida", Desc = "Carregando..." })
 TabStatus:Section({ Title = "Sobre" })
 TabStatus:Paragraph({
-  Title = "Koala Vôlei v4",
-  Desc = "Auto jogar + previsão de trajetória + hitbox visível. Em partida pública, use com moderação para não chamar atenção.",
+  Title = "Koala Vôlei v5",
+  Desc = "Revisão de estabilidade: loops protegidos, menos alocações, correções de timing. Em partida pública, use com moderação.",
 })
 
 --============================================================================--
@@ -673,7 +704,9 @@ local ultimoPulo = 0
 
 local function simularClique()
   pcall(function()
-    local vp = Camera.ViewportSize
+    local c = cam()
+    if not c then return end
+    local vp = c.ViewportSize
     local x, y = math.floor(vp.X / 2), math.floor(vp.Y / 2)
     VIM:SendMouseButtonEvent(x, y, 0, true, game, 1)
     task.wait(0.02)
@@ -702,11 +735,15 @@ local function condicaoAtaqueBase()
     and Estado.ultimoBatedor ~= LP.Name
     and (ATAQUES[Estado.ultimoTipo] or RECEBIDAS[Estado.ultimoTipo]) == true
 end
+-- conta o pulo do próprio script: por 0.45s após pular, considera "no ar"
+local function consideradoNoAr()
+  return noAr() or (tick() - ultimoPulo < 0.45)
+end
 
 local function tentarGolpear()
   local agora = tick()
   if agora - ultimoGolpe < 0.2 then return end
-  if condicaoDefesa() or (condicaoAtaqueBase() and noAr()) then
+  if condicaoDefesa() or (condicaoAtaqueBase() and consideradoNoAr()) then
     ultimoGolpe = agora
     executarGolpe()
   end
@@ -719,32 +756,30 @@ local function aoTocarHitbox(parte)
   tentarGolpear()
 end
 
-local conexaoToque
-local function ligarToque(bola)
-  if conexaoToque then pcall(function() conexaoToque:Disconnect() end) end
+ligarToque = function(bola)
+  if conexaoToque then pcall(function() conexaoToque:Disconnect() end) conexaoToque = nil end
   if not bola then return end
   task.spawn(function()
     local hb = bola:WaitForChild("HitBox", 8)
     if hb and bola == Estado.bola then
+      if conexaoToque then pcall(function() conexaoToque:Disconnect() end) end
       conexaoToque = hb.Touched:Connect(aoTocarHitbox)
     end
   end)
 end
 ligarToque(Estado.bola)
-Workspace.ChildAdded:Connect(function(f)
-  if f.Name:find("CLIENT_BALL") then ligarToque(f) end
-end)
 
 --============================================================================--
 -- 8) Previsão de trajetória (física de projétil)
 --============================================================================--
 local function preverAterrissagem(p0, v0, chaoY)
   local g = Workspace.Gravity
+  if not g or g <= 0 then return nil end
   local a = -0.5 * g
   local b = v0.Y
   local c = p0.Y - chaoY
   local disc = b * b - 4 * a * c
-  if disc < 0 then return nil end
+  if disc < 0 or disc ~= disc then return nil end -- NaN guard
   local sq = math.sqrt(disc)
   local t1 = (-b + sq) / (2 * a)
   local t2 = (-b - sq) / (2 * a)
@@ -752,7 +787,7 @@ local function preverAterrissagem(p0, v0, chaoY)
   if t1 > 0 and t2 > 0 then t = math.min(t1, t2)
   elseif t1 > 0 then t = t1
   elseif t2 > 0 then t = t2 end
-  if not t or t > 6 then return nil end
+  if not t or t ~= t or t > 6 then return nil end
   return p0 + Vector3.new(v0.X * t, v0.Y * t - 0.5 * g * t * t, v0.Z * t), t
 end
 
@@ -783,36 +818,38 @@ local function limparMiras()
     linhasMira[pl] = nil
   end
 end
-task.spawn(function() -- mira dos jogadores (10 Hz)
+task.spawn(function() -- mira dos jogadores (8 Hz)
   while true do
     task.wait(0.12)
-    if not F.MiraJogadores then
-      if next(linhasMira) then limparMiras() end
-    else
-    for _, p in ipairs(Players:GetPlayers()) do
-      if p ~= LP then
-        local char = p.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if hrp then
-          local part = linhasMira[p]
-          if not part then
-            part = novaParteVisual("KoalaMira", Color3.new(1, 1, 1))
-            linhasMira[p] = part
+    local ok = pcall(function()
+      if not F.MiraJogadores then
+        if next(linhasMira) then limparMiras() end
+      else
+        for _, p in ipairs(Players:GetPlayers()) do
+          if p ~= LP then
+            local char = p.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+              local part = linhasMira[p]
+              if not part then
+                part = novaParteVisual("KoalaMira", Color3.new(1, 1, 1))
+                linhasMira[p] = part
+              end
+              local aliado = tostring(p.Team) == meuTime()
+              part.Color = aliado and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(255, 60, 60)
+              local origem = hrp.Position + Vector3.new(0, 1.5, 0)
+              local alvo = origem + hrp.CFrame.LookVector * 12
+              part.Size = Vector3.new(0.12, 0.12, 12)
+              part.CFrame = CFrame.lookAt((origem + alvo) / 2, alvo)
+              part.Transparency = 0.35
+            elseif linhasMira[p] then
+              pcall(function() linhasMira[p]:Destroy() end)
+              linhasMira[p] = nil
+            end
           end
-          local aliado = tostring(p.Team) == meuTime()
-          part.Color = aliado and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(255, 60, 60)
-          local origem = hrp.Position + Vector3.new(0, 1.5, 0)
-          local alvo = origem + hrp.CFrame.LookVector * 12
-          part.Size = Vector3.new(0.12, 0.12, 12)
-          part.CFrame = CFrame.lookAt((origem + alvo) / 2, alvo)
-          part.Transparency = 0.35
-        elseif linhasMira[p] then
-          pcall(function() linhasMira[p]:Destroy() end)
-          linhasMira[p] = nil
         end
       end
-    end
-    end
+    end)
   end
 end)
 Players.PlayerRemoving:Connect(function(p)
@@ -824,8 +861,12 @@ end)
 
 --============================================================================--
 -- 10) Loop único por frame: hitbox + imã + previsão + trajetória + pulo
+--     (corpo protegido por pcall: um erro não derruba o loop)
 --============================================================================--
-RunService.RenderStepped:Connect(function(dt)
+local V3_ZERO = Vector3.zero
+local OFFSET_PULO = Vector3.new(0, 2, 0)
+
+local function corpoFrame(dt)
   local bola, part = Estado.bola, Estado.bolaPart
   local bolaOk = bola and bola.Parent and part and part.Parent
   local hrp = meuHRP()
@@ -853,16 +894,17 @@ RunService.RenderStepped:Connect(function(dt)
       if not tamanhoOriginal[hb] then tamanhoOriginal[hb] = part.Size end
       local gerenciando = F.Hitbox or hb:GetAttribute("Koala")
       if gerenciando then
-        local vel = part.AssemblyLinearVelocity
-        local aprox = false
-        if hrp then
+        local mult = F.Hitbox and F.HitboxMult or 1
+        if F.HitboxDinamica and hrp then
           local paraMim = hrp.Position - part.Position
           local dist = paraMim.Magnitude
-          aprox = dist > 0.001 and vel:Dot(paraMim / dist) > 20
+          if dist > 0.001 and part.AssemblyLinearVelocity:Dot(paraMim / dist) > 20 then
+            mult = mult * 1.6
+          end
         end
-        local mult = F.Hitbox and F.HitboxMult or 1
-        if F.HitboxDinamica and aprox then mult = mult * 1.6 end
-        if F.PingComp then mult = mult + math.max(0, math.floor((pingMs() - 50) / 50)) end
+        if F.PingComp then
+          mult = mult + math.max(0, math.floor((pingCache - 50) / 50))
+        end
         pcall(function()
           hb.Size = tamanhoOriginal[hb] * mult
           hb.CanTouch = true
@@ -899,18 +941,14 @@ RunService.RenderStepped:Connect(function(dt)
 
   ---------- TRAJETÓRIA VISUAL ----------
   if F.Trajetoria then
-    local chaoY = posMim.Y - 3
-    local pouso = preverAterrissagem(posBola, vel, chaoY)
+    local pouso = preverAterrissagem(posBola, vel, posMim.Y - 3)
     if pouso then
       local meio = (posBola + pouso) / 2
       local comp = (pouso - posBola).Magnitude
       trajLinha.Size = Vector3.new(0.15, 0.15, comp)
       trajLinha.CFrame = CFrame.lookAt(meio, pouso)
       trajLinha.Transparency = 0.25
-      trajLinha.Color = Color3.fromRGB(255, 255, 0)
-      local meuLado = posMim.Z < 0
-      local pousoMeuLado = pouso.Z < 0
-      local perigo = (pousoMeuLado == meuLado)
+      local perigo = (pouso.Z < 0) == (posMim.Z < 0)
       trajMarcador.Color = perigo and Color3.fromRGB(255, 50, 50) or Color3.fromRGB(0, 255, 120)
       trajMarcador.Size = Vector3.new(0.25, 5, 5)
       trajMarcador.CFrame = CFrame.new(pouso + Vector3.new(0, 0.2, 0)) * CFrame.Angles(0, 0, math.rad(90))
@@ -923,13 +961,13 @@ RunService.RenderStepped:Connect(function(dt)
 
   ---------- IMÃ DE BOLA ----------
   if F.ImaBola and Estado.emJogo then
-    local paraMim = (posMim + Vector3.new(0, 2, 0)) - posBola
+    local paraMim = (posMim + OFFSET_PULO) - posBola
     local dist = paraMim.Magnitude
     if dist > 2 and dist < F.ImaDist then
       local vindo = vel.Magnitude < 5 or vel:Dot(paraMim / dist) > 0
       if vindo then
         local passo = math.clamp(45 * dt / dist, 0, 0.5)
-        local nova = posBola:Lerp(posMim + Vector3.new(0, 2, 0), passo)
+        local nova = posBola:Lerp(posMim + OFFSET_PULO, passo)
         pcall(function()
           bola:PivotTo(CFrame.new(nova) * (part.CFrame - posBola))
         end)
@@ -946,15 +984,17 @@ RunService.RenderStepped:Connect(function(dt)
       if dist <= 60 then
         local velAprox = dist > 0.001 and vel:Dot(paraMim / dist) or 0
         local raio = Estado.hitboxRaio + 1.5
-        local janela = (F.ReacaoMs / 1000) + (pingMs() / 2000)
+        local janela = (F.ReacaoMs / 1000) + (pingCache / 2000)
         local iminente = dist <= raio
           or (velAprox > 5 and ((dist - raio) / velAprox) <= janela)
         if iminente then tentarGolpear() end
 
-        -- AUTO PULAR: bola alta chegando e contexto de ataque
-        if F.AutoPular and condicaoAtaqueBase() and not noAr() then
+        -- AUTO PULAR
+        if F.AutoPular and condicaoAtaqueBase() and not consideradoNoAr() then
           if agora - ultimoPulo >= 0.9 then
-            local distH = (Vector3.new(posBola.X, 0, posBola.Z) - Vector3.new(posMim.X, 0, posMim.Z)).Magnitude
+            local dx = posBola.X - posMim.X
+            local dz = posBola.Z - posMim.Z
+            local distH = math.sqrt(dx * dx + dz * dz)
             local altura = posBola.Y - posMim.Y
             if distH <= raio + 5 and altura >= 2.5 and altura <= 12 then
               local hum = meuHum()
@@ -968,6 +1008,10 @@ RunService.RenderStepped:Connect(function(dt)
       end
     end
   end
+end
+
+RunService.RenderStepped:Connect(function(dt)
+  local ok = pcall(corpoFrame, dt)
 end)
 
 --============================================================================--
@@ -982,8 +1026,7 @@ task.spawn(function()
         local hrp = meuHRP()
         local part = Estado.bolaPart
         if not (hum and hrp and part) then return end
-        local chaoY = hrp.Position.Y - 3
-        local pouso = preverAterrissagem(part.Position, part.AssemblyLinearVelocity, chaoY) or part.Position
+        local pouso = preverAterrissagem(part.Position, part.AssemblyLinearVelocity, hrp.Position.Y - 3) or part.Position
         local ladoNeg = hrp.Position.Z < 0
         local alvoZ = pouso.Z
         if ladoNeg then alvoZ = math.min(alvoZ, -2.5) else alvoZ = math.max(alvoZ, 2.5) end
@@ -1008,7 +1051,10 @@ local function mirarQuadraAdversaria()
     hrp.CFrame = CFrame.lookAt(hrp.Position, alvo)
   end)
   pcall(function()
-    Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, Vector3.new(0, hrp.Position.Y + 2, alvoZ))
+    local c = cam()
+    if c then
+      c.CFrame = CFrame.lookAt(c.CFrame.Position, Vector3.new(0, hrp.Position.Y + 2, alvoZ))
+    end
   end)
   return alvo
 end
@@ -1056,6 +1102,8 @@ local function cadeiaVisivel(ui)
   local p = ui
   while p and p ~= game do
     if p:IsA("GuiObject") and not p.Visible then return false end
+    -- ScreenGui/GuiLayerCollector desligado = tudo dentro invisível
+    if p:IsA("LayerCollector") and not p.Enabled then return false end
     p = p.Parent
   end
   return true
@@ -1124,8 +1172,9 @@ if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "functi
       if self == R.Interact and type(args[1]) == "table" then
         local d = args[1]
         if d.Move == "Spike" then
-          if F.SuperCorte and Camera then
-            local lv = Camera.CFrame.LookVector
+          local c = cam()
+          if F.SuperCorte and c then
+            local lv = c.CFrame.LookVector
             local mergulho = Vector3.new(0, -F.SuperCorteForca / 100, 0)
             local dir = (lv + mergulho).Unit
             d.LookVector = dir
@@ -1139,16 +1188,17 @@ if typeof(hookmetamethod) == "function" and typeof(getnamecallmethod) == "functi
               d.SpecialCharge = 1
               d.ClientCanRunSpecial = true
             end
-            if F.CorteNaMira and Camera then
-              d.LookVector = Camera.CFrame.LookVector
+            if F.CorteNaMira and c then
+              d.LookVector = c.CFrame.LookVector
             end
           end
         elseif (d.Move == "Bump" or d.Move == "Set") and F.PasseFacil then
+          local c = cam()
           d.Charge = (d.Move == "Bump") and 0 or 1
           d.SpecialCharge = 0
           d.TiltDirection = Vector3.yAxis
           d.MoveDirection = Vector3.zero
-          if Camera then d.LookVector = Camera.CFrame.LookVector end
+          if c then d.LookVector = c.CFrame.LookVector end
           d.ClientCanRunSpecial = false
         end
         return velho(self, d)
@@ -1190,13 +1240,15 @@ end)
 
 RunService.Stepped:Connect(function() -- noclip
   if not F.Noclip then return end
-  local char = LP.Character
-  if not char then return end
-  for _, p in ipairs(char:GetDescendants()) do
-    if p:IsA("BasePart") and p.CanCollide then
-      p.CanCollide = false
+  pcall(function()
+    local char = LP.Character
+    if not char then return end
+    for _, p in ipairs(char:GetDescendants()) do
+      if p:IsA("BasePart") and p.CanCollide then
+        p.CanCollide = false
+      end
     end
-  end
+  end)
 end)
 
 task.spawn(function() -- auto spins
@@ -1243,7 +1295,7 @@ task.spawn(function() -- status ao vivo
         tostring(LP:GetAttribute("Gameplay_Ability") or "?"),
         tostring(LP:GetAttribute("User_Level") or 0),
         tostring(LP:GetAttribute("Ability_Charge") or 0),
-        math.floor(pingMs())
+        math.floor(pingCache)
       ))
     end)
     pcall(function()
@@ -1263,57 +1315,59 @@ local espBolaHL, espBolaTag
 task.spawn(function()
   while true do
     task.wait(0.4)
-    if F.ESPBola and Estado.bola and Estado.bolaPart then
-      if not espBolaHL or espBolaHL.Parent ~= Estado.bola then
-        pcall(function() if espBolaHL then espBolaHL:Destroy() end end)
-        pcall(function() if espBolaTag then espBolaTag:Destroy() end end)
-        espBolaHL = Instance.new("Highlight")
-        espBolaHL.FillColor = Color3.fromRGB(255, 200, 0)
-        espBolaHL.OutlineColor = Color3.fromRGB(255, 255, 255)
-        espBolaHL.Parent = Estado.bola
-        espBolaTag = Instance.new("BillboardGui")
-        espBolaTag.Size = UDim2.fromOffset(120, 30)
-        espBolaTag.StudsOffset = Vector3.new(0, 3, 0)
-        espBolaTag.AlwaysOnTop = true
-        espBolaTag.Adornee = Estado.bolaPart
-        local t = Instance.new("TextLabel")
-        t.Name = "Txt"
-        t.Size = UDim2.fromScale(1, 1)
-        t.BackgroundTransparency = 1
-        t.TextColor3 = Color3.fromRGB(255, 220, 0)
-        t.TextStrokeTransparency = 0.5
-        t.Font = Enum.Font.GothamBold
-        t.TextSize = 14
-        t.Parent = espBolaTag
-        espBolaTag.Parent = Estado.bola
-      end
-      pcall(function()
-        local hrp = meuHRP()
-        if hrp then
-          espBolaTag.Txt.Text = string.format("BOLA • %dm", math.floor((Estado.bolaPart.Position - hrp.Position).Magnitude))
+    pcall(function()
+      if F.ESPBola and Estado.bola and Estado.bolaPart then
+        if not espBolaHL or espBolaHL.Parent ~= Estado.bola then
+          pcall(function() if espBolaHL then espBolaHL:Destroy() end end)
+          pcall(function() if espBolaTag then espBolaTag:Destroy() end end)
+          espBolaHL = Instance.new("Highlight")
+          espBolaHL.FillColor = Color3.fromRGB(255, 200, 0)
+          espBolaHL.OutlineColor = Color3.fromRGB(255, 255, 255)
+          espBolaHL.Parent = Estado.bola
+          espBolaTag = Instance.new("BillboardGui")
+          espBolaTag.Size = UDim2.fromOffset(120, 30)
+          espBolaTag.StudsOffset = Vector3.new(0, 3, 0)
+          espBolaTag.AlwaysOnTop = true
+          espBolaTag.Adornee = Estado.bolaPart
+          local t = Instance.new("TextLabel")
+          t.Name = "Txt"
+          t.Size = UDim2.fromScale(1, 1)
+          t.BackgroundTransparency = 1
+          t.TextColor3 = Color3.fromRGB(255, 220, 0)
+          t.TextStrokeTransparency = 0.5
+          t.Font = Enum.Font.GothamBold
+          t.TextSize = 14
+          t.Parent = espBolaTag
+          espBolaTag.Parent = Estado.bola
         end
-      end)
-    else
-      pcall(function() if espBolaHL then espBolaHL:Destroy() espBolaHL = nil end end)
-      pcall(function() if espBolaTag then espBolaTag:Destroy() espBolaTag = nil end end)
-    end
-    for _, p in ipairs(Players:GetPlayers()) do
-      if p ~= LP then
-        local char = p.Character
-        local hl = char and char:FindFirstChild("KoalaESP")
-        if F.ESPJogadores and char then
-          if not hl then
-            hl = Instance.new("Highlight")
-            hl.Name = "KoalaESP"
-            hl.FillTransparency = 0.6
-            hl.Parent = char
+        pcall(function()
+          local hrp = meuHRP()
+          if hrp then
+            espBolaTag.Txt.Text = string.format("BOLA • %dm", math.floor((Estado.bolaPart.Position - hrp.Position).Magnitude))
           end
-          hl.FillColor = (tostring(p.Team) == meuTime()) and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(255, 60, 60)
-        elseif hl then
-          hl:Destroy()
+        end)
+      else
+        pcall(function() if espBolaHL then espBolaHL:Destroy() espBolaHL = nil end end)
+        pcall(function() if espBolaTag then espBolaTag:Destroy() espBolaTag = nil end end)
+      end
+      for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP then
+          local char = p.Character
+          local hl = char and char:FindFirstChild("KoalaESP")
+          if F.ESPJogadores and char then
+            if not hl then
+              hl = Instance.new("Highlight")
+              hl.Name = "KoalaESP"
+              hl.FillTransparency = 0.6
+              hl.Parent = char
+            end
+            hl.FillColor = (tostring(p.Team) == meuTime()) and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(255, 60, 60)
+          elseif hl then
+            hl:Destroy()
+          end
         end
       end
-    end
+    end)
   end
 end)
 
@@ -1338,16 +1392,21 @@ end)
 
 pcall(function()
   LP.Idled:Connect(function()
-    VU:Button2Down(Vector2.new(0, 0), Camera.CFrame)
-    task.wait(1)
-    VU:Button2Up(Vector2.new(0, 0), Camera.CFrame)
+    pcall(function()
+      local c = cam()
+      if c then
+        VU:Button2Down(Vector2.new(0, 0), c.CFrame)
+        task.wait(1)
+        VU:Button2Up(Vector2.new(0, 0), c.CFrame)
+      end
+    end)
   end)
 end)
 
 task.defer(function()
   if hooksOk then
-    aviso("Koala Vôlei v4", "Carregado! RightControl abre/fecha o menu.", 5)
+    aviso("Koala Vôlei v5", "Carregado! RightControl abre/fecha o menu.", 5)
   else
-    aviso("Koala Vôlei v4", "Carregado (hooks indisponíveis — assistências desligadas).", 6)
+    aviso("Koala Vôlei v5", "Carregado (hooks indisponíveis — assistências desligadas).", 6)
   end
 end)
