@@ -749,6 +749,25 @@ local function montarCartao(ovo)
             else
                 selecionado = f:GetAttribute("Uid")
             end
+            -- destaque imediato
+            for uid2, f2 in pairs(cartoes) do
+                local st = f2:FindFirstChildOfClass("UIStroke")
+                if st then
+                    if uid2 == selecionado then
+                        st.Transparency = 0
+                        f2.BackgroundColor3 = C.cartaoOn
+                    else
+                        st.Transparency = 1
+                        f2.BackgroundColor3 = C.cartao
+                    end
+                end
+            end
+            if selecionado then
+                local o = ovoPorUid(selecionado)
+                local fs = cartoes[selecionado]
+                local st3 = o and fs and fs:FindFirstChildOfClass("UIStroke")
+                if st3 then st3.Color = RAR_COR[o.Rar] or RAR_COR.Unknown end
+            end
         end)
         cartoes[ovo.Uid] = f
     end
