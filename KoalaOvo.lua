@@ -1,20 +1,17 @@
 --[[
-    KOALA HUB — ROUBE UM OVO (Steal An Egg) — PlaceId 107778070777162
+    KOALA OVO — ROUBE UM OVO (Steal An Egg) — PlaceId 107778070777162
     ------------------------------------------------------------------
-    v1 — GUI propria, leve, sem biblioteca externa.
+    v2 — GUI simples estilo Miranda Hub: lista de ovos + GO/STOP.
 
-    Por que essa GUI nao chama atencao:
-      * Nome do ScreenGui aleatorio a cada execucao
-      * Fica fora do PlayerGui (gethui/CoreGui)
-      * Nao usa identifyexecutor nem nada que entregue o executor
-      * Tudo dentro de pcall — um erro nao derruba o script
+    Como funciona o roubo (do jeito que nao da erro):
+      1. Toque num ovo da lista (ou aperte GO pra ir no melhor)
+      2. O script VOA voce ate o ovo e tenta pegar pelo remote
+      3. Se pegar: VOCE volta ANDANDO pra base (a volta automatica
+         era o que dava erro — por isso a volta e manual)
 
-    Secoes:
-      Farm      = auto roubar (com filtro de raridade), chocar, colocar, esteira
-      ESP       = ovos com cor e nome da raridade atraves da parede
-      Movimento = velocidade, pulo, pulo infinito, atravessar paredes
-      Teleporte = base, entrega, zonas do mapa
-      Outros    = anti-AFK, anti-lag, status ao vivo
+    Anti-AFK da esteira:
+      A cada 2 minutos o script abre a loja e fecha, pro jogo
+      contar como atividade enquanto voce fica na esteira.
 
     Uso:
       loadstring(game:HttpGet("https://raw.githubusercontent.com/rodrigsapps/KoalaUI/main/KoalaOvo.lua"))()
@@ -25,53 +22,41 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace         = game:GetService("Workspace")
 local RunService        = game:GetService("RunService")
 local TweenService      = game:GetService("TweenService")
-local Lighting          = game:GetService("Lighting")
+local VIM               = game:GetService("VirtualInputManager")
 
 local LP = Players.LocalPlayer
 
 --==================================================================--
 --  ESTADO
 --==================================================================--
-local cfg = {
-    autoRoubar   = false,
-    autoChocar   = false,
-    autoColocar  = false,
-    autoEsteira  = false,
-    espOvos      = false,
-    espSoRaros   = false,
-    velocidade   = 16,
-    pulo         = 50,
-    puloInfinito = false,
-    noclip       = false,
-    antiAfk      = true,
-    raridadeMin  = "Rare",
-    zonaAlvo     = "Forest",
-}
+local voando      = false
+local noclipFarm  = false
+local selecionado = nil   -- uid do ovo tocado na lista
+local roubados    = 0
+local statusTxt   = "Escolhe um ovo e aperta GO"
+local esteiraAfk  = true
+local espLigado   = false
 
-local stats = { roubados = 0, chocados = 0 }
-local statusAtual = "Parado"
-local farmOcupado = false   -- true enquanto esta roubando (liga noclip no trajeto)
-
-local RARIDADES = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Cosmic", "Secret", "Eternal", "Divine" }
-local RAR_IDX = {}
-for i, r in ipairs(RARIDADES) do RAR_IDX[r] = i end
+--==================================================================--
+--  RARIDADES / CORES
+--==================================================================--
 local RAR_COR = {
-    Common    = Color3.fromRGB(180, 180, 180),
+    Common    = Color3.fromRGB(170, 170, 175),
     Uncommon  = Color3.fromRGB(80, 220, 100),
     Rare      = Color3.fromRGB(60, 140, 255),
     Epic      = Color3.fromRGB(170, 85, 247),
     Legendary = Color3.fromRGB(251, 191, 36),
-    Mythic    = Color3.fromRGB(139, 92, 246),
+    Mythic    = Color3.fromRGB(230, 60, 90),
     Cosmic    = Color3.fromRGB(6, 182, 212),
     Secret    = Color3.fromRGB(249, 115, 22),
     Eternal   = Color3.fromRGB(217, 70, 239),
     Divine    = Color3.fromRGB(244, 63, 94),
+    Unknown   = Color3.fromRGB(120, 120, 130),
 }
-
-local ZONAS = { "Forest", "Lake", "Desert", "Jungle", "Snow", "Volcano", "Abyss Ocean", "Prehistoric", "Cosmic", "Cherry Blossom", "Titan Temple", "Light Dark" }
+local RAR_RANK = { Common=1, Uncommon=2, Rare=3, Epic=4, Legendary=5, Mythic=6, Cosmic=7, Secret=8, Eternal=9, Divine=10, Unknown=0 }
 
 --==================================================================--
---  UTILITARIOS
+--  UTILS
 --==================================================================--
 local function aviso(msg, dur)
     print("[KoalaOvo] " .. tostring(msg))
@@ -81,34 +66,17 @@ local function aviso(msg, dur)
     end)
 end
 
-local function pegarChar()
-    return LP.Character
-end
-local function pegarHRP()
-    local c = LP.Character
-    return c and c:FindFirstChild("HumanoidRootPart")
-end
-local function pegarHum()
-    local c = LP.Character
-    return c and c:FindFirstChildOfClass("Humanoid")
-end
-
-local function paraVector3(p)
-    local ok, tipo = pcall(typeof, p)
-    if not ok then return nil end
-    if tipo == "Vector3" then return p end
-    if tipo == "CFrame" then return p.Position end
-    if tipo == "table" then
-        local x = p.X or p.x or p[1]
-        local y = p.Y or p.y or p[2]
-        local z = p.Z or p.z or p[3]
-        if x and y and z then return Vector3.new(x, y, z) end
-    end
-    return nil
+local function fmtDinheiro(n)
+    n = tonumber(n) or 0
+    if n >= 1e9 then return string.format("%.2fb", n / 1e9) end
+    if n >= 1e6 then return string.format("%.2fm", n / 1e6) end
+    if n >= 1e3 then return string.format("%.2fk", n / 1e3) end
+    if n > 0    then return tostring(math.floor(n)) end
+    return ""
 end
 
 --==================================================================--
---  REMOTES (nomes reais, conferidos em scripts abertos do jogo)
+--  REMOTES (nomes reais do jogo)
 --==================================================================--
 local NET = nil
 pcall(function()
@@ -120,181 +88,122 @@ local function net(nome)
         local r = NET:FindFirstChild(nome)
         if r then return r end
     end
-    -- plano B: procura so pelo nome final em qualquer lugar
     local curto = nome:match("([^/]+)$") or nome
-    local achado = ReplicatedStorage:FindFirstChild(curto, true)
-    return achado
+    return ReplicatedStorage:FindFirstChild(curto, true)
 end
 
 local function rfCarry()    return net("RF/EggWorld/AskFieldEggCarry")    end
 local function rfSnapshot() return net("RF/EggWorld/AskFieldEggSnapshot") end
-local function rfLive()     return net("RF/EggWorld/AskLiveSnapshot")     end
-local function rfHatch()    return net("RF/EggWorld/AskHatch")            end
-local function rfFinish()   return net("RF/EggWorld/AskFinishHatch")      end
-local function rfPlace()    return net("RF/EggWorld/AskPlaceEgg")         end
-local function rfPlots()    return net("RF/Plots/AskState") or net("RF/Homestead/AskState") end
-local function rfTierUp()   return net("RF/Treadmill/AskTierRaise")       end
-local function rfDon()      return net("RF/Treadmill/AskDon") or net("RF/Treadmill/AskMount") end
-local function rfWearStill() return net("RF/Treadmill/AskWearStill")      end
 
 local function chamarRF(remote, ...)
-    if not remote then return false, nil end
+    if not remote then return false end
     local args = { ... }
-    local ok, ret = pcall(function()
+    local ok = pcall(function()
         if remote:IsA("RemoteFunction") then
-            return remote:InvokeServer(unpack(args))
+            remote:InvokeServer(table.unpack(args))
         else
-            remote:FireServer(unpack(args))
-            return true
+            remote:FireServer(table.unpack(args))
         end
     end)
-    return ok, ret
+    return ok
+end
+
+-- modulo com dados dos ovos (raridade, ganho por segundo, nome)
+local AssetItems = nil
+pcall(function()
+    AssetItems = require(ReplicatedStorage:WaitForChild("Shared", 5):WaitForChild("Util", 5):WaitForChild("AssetItems", 5))
+end)
+
+local function dadosDaCategoria(cat)
+    -- retorna raridade, ganhoPorSegundo
+    local rar, ganho = nil, 0
+    if AssetItems then
+        pcall(function()
+            if AssetItems.Assets and AssetItems.Assets[cat] then
+                local a = AssetItems.Assets[cat]
+                rar = a.Rarity or (a.Egg and a.Egg.Rarity)
+                ganho = a.EarningRate or (a.Egg and a.Egg.EarningRate) or 0
+            end
+            if (not ganho or ganho == 0) and AssetItems.ProfileIncomePerSecond then
+                ganho = AssetItems.ProfileIncomePerSecond(cat) or 0
+            end
+        end)
+    end
+    return rar or "Unknown", tonumber(ganho) or 0
 end
 
 --==================================================================--
---  SNAPSHOT DOS OVOS DO MAPA (cache de 5s)
+--  LISTA DE OVOS (snapshot do servidor, cache 4s)
 --==================================================================--
 local ovosCache = {}
-local ovosCacheTempo = 0
+local ovosTempo = 0
 
-local function atualizarSnapshot(forcar)
-    if not forcar and (os.clock() - ovosCacheTempo) < 5 and #ovosCache > 0 then
+local ESTADOS_OK = { Slot = true, Dropped = true, GuardCarried = true, [1] = true }
+
+local function atualizarOvos(forcar)
+    if not forcar and (os.clock() - ovosTempo) < 4 and #ovosCache > 0 then
         return ovosCache
     end
     local r = rfSnapshot()
     local ok, ret = pcall(function() return r and r:InvokeServer() end)
-    if ok and type(ret) == "table" then
-        local lista = {}
-        local recs = type(ret.Records) == "table" and ret.Records or ret
-        for chave, rec in pairs(recs) do
-            if type(rec) == "table" then
-                if not rec.Uid and type(chave) == "string" then
-                    rec.Uid = chave
-                end
-                if rec.Uid then
-                    table.insert(lista, rec)
-                end
+    if not (ok and type(ret) == "table") then return ovosCache end
+
+    local lista = {}
+    local recs = type(ret.Records) == "table" and ret.Records or ret
+    for chave, rec in pairs(recs) do
+        if type(rec) == "table" then
+            local uid = rec.Uid or (type(chave) == "string" and chave)
+            local cf = rec.BoundsCFrame
+            local pos = nil
+            pcall(function() pos = cf and cf.Position end)
+            if not pos then
+                local m = rec.PhysicalModel
+                pcall(function()
+                    local p = m and (m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart"))
+                    if p then pos = p.Position end
+                end)
+            end
+            local roubavel = ESTADOS_OK[rec.State] == true
+            -- ovos da area inicial / da propria base nao entram
+            if pos and pos.X < 530 then roubavel = false end
+            if uid and tostring(uid):find("FirstArea") then roubavel = false end
+
+            if uid and pos and roubavel then
+                local cat = rec.AssetCategory or rec.Name or "Ovo"
+                local rar, ganho = dadosDaCategoria(cat)
+                if rar == "Unknown" and type(rec.Rarity) == "string" then rar = rec.Rarity end
+                table.insert(lista, {
+                    Uid = uid, Cat = cat, Rar = rar, Ganho = ganho, Pos = pos,
+                    Area = tostring(rec.AreaId or ""),
+                })
             end
         end
-        if #lista > 0 then
-            ovosCache = lista
-            ovosCacheTempo = os.clock()
-        end
+    end
+    table.sort(lista, function(a, b)
+        if a.Ganho ~= b.Ganho then return a.Ganho > b.Ganho end
+        return (RAR_RANK[a.Rar] or 0) > (RAR_RANK[b.Rar] or 0)
+    end)
+    if #lista > 0 then
+        ovosCache = lista
+        ovosTempo = os.clock()
     end
     return ovosCache
 end
 
-local function modeloDoOvo(uid)
-    local pasta = Workspace:FindFirstChild("AreaEggSlotsClient")
-    if not pasta then return nil end
-    return pasta:FindFirstChild(tostring(uid))
+local function melhorOvo()
+    local lista = atualizarOvos(false)
+    return lista[1]
 end
 
-local function raridadeDoModelo(modelo)
-    local ok, rar = pcall(function()
-        local data = modelo:FindFirstChild("Data")
-        local r = data and data:FindFirstChild("Rarity")
-        return r and r.Value
-    end)
-    if ok and type(rar) == "string" then return rar end
-    return nil
-end
-
-local function posicaoDoOvo(rec)
-    local modelo = modeloDoOvo(rec.Uid)
-    if modelo then
-        local p = modelo.PrimaryPart or modelo:FindFirstChildWhichIsA("BasePart")
-        if p then return p.Position end
+local function ovoPorUid(uid)
+    for _, o in ipairs(atualizarOvos(false)) do
+        if o.Uid == uid then return o end
     end
-    return paraVector3(rec.Position)
-end
-
---==================================================================--
---  BASE / PLOT DO JOGADOR
---==================================================================--
-local plotCache, penCache = nil, nil
-
-local function acharPlot()
-    if plotCache and plotCache.Parent then return plotCache, penCache end
-    local plots = Workspace:FindFirstChild("Plots")
-    if not plots then return nil, nil end
-
-    -- caminho 1: pergunta ao servidor qual slot e meu
-    local r = rfPlots()
-    local ok, ret = pcall(function() return r and r:InvokeServer() end)
-    if ok and type(ret) == "table" and type(ret.OwnersBySlot) == "table" then
-        for slot, dono in pairs(ret.OwnersBySlot) do
-            if tostring(dono) == tostring(LP.UserId) or dono == LP.Name then
-                local p = plots:FindFirstChild(tostring(slot))
-                if p then
-                    plotCache = p
-                    penCache = p:FindFirstChild("PetArea") or p:FindFirstChildWhichIsA("BasePart", true)
-                    return plotCache, penCache
-                end
-            end
-        end
-    end
-    -- caminho 2: procura plot com meu nome/userid
-    for _, p in ipairs(plots:GetChildren()) do
-        local dono = p:GetAttribute("Owner") or p:GetAttribute("OwnerId") or p:GetAttribute("UserId")
-        if tostring(dono) == tostring(LP.UserId) or tostring(dono) == LP.Name then
-            plotCache = p
-            penCache = p:FindFirstChild("PetArea") or p:FindFirstChildWhichIsA("BasePart", true)
-            return plotCache, penCache
-        end
-    end
-    return nil, nil
-end
-
-local function posicaoBase()
-    local plot, pen = acharPlot()
-    if pen and pen:IsA("BasePart") then return pen.Position end
-    if plot then
-        local p = plot.PrimaryPart or plot:FindFirstChildWhichIsA("BasePart", true)
-        if p then return p.Position end
-    end
-    local entrega = Workspace:FindFirstChild("DeliveryHitbox", true)
-    if entrega and entrega:IsA("BasePart") then return entrega.Position end
     return nil
 end
 
 --==================================================================--
---  CARREGANDO OVO?
---==================================================================--
-local function ferramentaOvo(inst)
-    if not inst:IsA("Tool") then return false end
-    if inst:GetAttribute("UID") or inst:GetAttribute("EggUid") then return true end
-    return inst.Name:lower():find("egg", 1, true) ~= nil
-end
-
-local function ovoNaMao()
-    local c = LP.Character
-    if not c then return nil, nil end
-    for _, filho in ipairs(c:GetChildren()) do
-        if ferramentaOvo(filho) then
-            local uid = filho:GetAttribute("UID") or filho:GetAttribute("EggUid") or filho.Name
-            return filho, uid
-        end
-    end
-    return nil, nil
-end
-
-local function ovosNaMochila()
-    local lista = {}
-    local mochila = LP:FindFirstChild("Backpack")
-    if mochila then
-        for _, filho in ipairs(mochila:GetChildren()) do
-            if ferramentaOvo(filho) then
-                local uid = filho:GetAttribute("UID") or filho:GetAttribute("EggUid") or filho.Name
-                table.insert(lista, uid)
-            end
-        end
-    end
-    return lista
-end
-
---==================================================================--
---  MOVIMENTO (tween com cancelamento)
+--  VOO (tween cancelavel) + NOCLIP durante o voo
 --==================================================================--
 local tweenAtivo = nil
 
@@ -305,16 +214,21 @@ local function cancelarTween()
     end
 end
 
+local function pegarHRP()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
 local function irPara(pos, velocidade)
     local hrp = pegarHRP()
     if not hrp then return false end
     cancelarTween()
     local dist = (hrp.Position - pos).Magnitude
     if dist < 3 then return true end
-    local tempo = math.clamp(dist / (velocidade or 60), 0.1, 30)
-    local alvo = CFrame.new(pos + Vector3.new(0, 2, 0))
+    local tempo = math.clamp(dist / (velocidade or 100), 0.1, 30)
     local ok, tw = pcall(function()
-        return TweenService:Create(hrp, TweenInfo.new(tempo, Enum.EasingStyle.Linear), { CFrame = alvo })
+        return TweenService:Create(hrp, TweenInfo.new(tempo, Enum.EasingStyle.Linear),
+            { CFrame = CFrame.new(pos) })
     end)
     if not ok or not tw then return false end
     tweenAtivo = tw
@@ -325,374 +239,259 @@ local function irPara(pos, velocidade)
         task.wait(0.1)
     end
     if tweenAtivo == tw then tweenAtivo = nil end
-    local hrp2 = pegarHRP()
-    return hrp2 and (hrp2.Position - pos).Magnitude < 12
+    local h2 = pegarHRP()
+    return h2 and (h2.Position - pos).Magnitude < 14
+end
+
+RunService.Stepped:Connect(function()
+    if not noclipFarm then return end
+    pcall(function()
+        local c = LP.Character
+        if c then
+            for _, p in ipairs(c:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide = false end
+            end
+        end
+    end)
+end)
+
+--==================================================================--
+--  PEGAR OVO
+--==================================================================--
+local function ferramentaOvo(inst)
+    if not inst:IsA("Tool") then return false end
+    if inst:GetAttribute("UID") or inst:GetAttribute("EggUid") then return true end
+    return inst.Name:lower():find("egg", 1, true) ~= nil
+end
+
+local function ovoNaMao()
+    local c = LP.Character
+    if not c then return nil end
+    for _, filho in ipairs(c:GetChildren()) do
+        if ferramentaOvo(filho) then
+            return filho:GetAttribute("UID") or filho:GetAttribute("EggUid") or filho.Name
+        end
+    end
+    return nil
+end
+
+local function tentarPegar(uid)
+    local r = rfCarry()
+    if r then
+        chamarRF(r, { Uid = uid })
+        chamarRF(r, uid)
+    end
+    -- plano B: aperta o prompt de pegar que estiver perto
+    pcall(function()
+        local hrp = pegarHRP()
+        if not hrp then return end
+        local pasta = Workspace:FindFirstChild("AreaEggSlotsClient")
+        local modelo = pasta and pasta:FindFirstChild(tostring(uid))
+        local alvos = modelo and modelo:GetDescendants() or {}
+        for _, d in ipairs(alvos) do
+            if d:IsA("ProximityPrompt") then
+                fireproximityprompt(d)
+            end
+        end
+    end)
 end
 
 --==================================================================--
---  ROUBO
+--  ROUBO (voo de ida, volta manual)
 --==================================================================--
-local function escolherMelhorOvo()
-    local lista = atualizarSnapshot(false)
-    local minIdx = RAR_IDX[cfg.raridadeMin] or 3
-    local hrp = pegarHRP()
-    local melhor, melhorScore = nil, -1
-    for _, rec in ipairs(lista) do
-        local rar = rec.Rarity
-        if not rar then
-            local modelo = modeloDoOvo(rec.Uid)
-            rar = modelo and raridadeDoModelo(modelo) or "Common"
+local function goRoubo()
+    if voando then return end
+    local alvo = selecionado and ovoPorUid(selecionado) or melhorOvo()
+    if not alvo then
+        statusTxt = "Nenhum ovo no mapa agora"
+        atualizarOvos(true)
+        return
+    end
+    voando = true
+    noclipFarm = true
+    local okVoo, err = pcall(function()
+        statusTxt = "Voando ate: " .. tostring(alvo.Cat)
+        -- sobe, cruza por cima, desce
+        irPara(alvo.Pos + Vector3.new(0, 28, 0), 130)
+        if not voando then return end
+        irPara(alvo.Pos + Vector3.new(0, 2, 0), 70)
+        if not voando then return end
+
+        statusTxt = "Pegando " .. tostring(alvo.Cat) .. "..."
+        local t0 = os.clock()
+        local pegou = false
+        while os.clock() - t0 < 8 and voando do
+            tentarPegar(alvo.Uid)
+            task.wait(0.3)
+            if ovoNaMao() then pegou = true break end
         end
-        local idx = RAR_IDX[rar] or 1
-        if idx >= minIdx then
-            local pos = posicaoDoOvo(rec)
-            if pos then
-                local dist = hrp and (hrp.Position - pos).Magnitude or 500
-                local score = idx * 10000 - dist
-                if score > melhorScore then
-                    melhorScore = score
-                    melhor = { Uid = rec.Uid, Rarity = rar, Pos = pos }
-                end
+        if pegou then
+            roubados = roubados + 1
+            statusTxt = "Pegou! Volta ANDANDO pra base"
+            aviso("Pegou! Agora volta ANDANDO (a volta automatica da erro)", 5)
+        else
+            statusTxt = "Nao peguei sozinho — aperta o botao de pegar"
+            aviso("Nao consegui pegar. Toca no ovo ai do lado!", 5)
+        end
+    end)
+    voando = false
+    noclipFarm = false
+    cancelarTween()
+    if not okVoo then
+        statusTxt = "Erro: " .. tostring(err):sub(1, 40)
+    end
+end
+
+--==================================================================--
+--  ANTI-AFK ESTEIRA: abre e fecha a loja a cada 2 min
+--==================================================================--
+local function clicarEm(botao)
+    pcall(function()
+        local pos = botao.AbsolutePosition + botao.AbsoluteSize / 2
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
+        task.wait(0.06)
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
+    end)
+end
+
+local function acharBotaoLoja()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local melhor = nil
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+            local nome = d.Name:lower()
+            local texto = ""
+            pcall(function() texto = (d.Text or ""):lower() end)
+            if nome:find("shop") or nome:find("loja") or nome:find("store")
+                or texto:find("shop") or texto:find("loja") or texto:find("store") then
+                melhor = d
+                break
             end
         end
     end
     return melhor
 end
 
-local function tentarPegar(uid)
-    local r = rfCarry()
-    if not r then return false end
-    chamarRF(r, { Uid = uid })
-    chamarRF(r, uid)
-    -- aperta prompts de pegar perto do ovo (plano B)
-    pcall(function()
-        local modelo = modeloDoOvo(uid)
-        if modelo then
-            for _, d in ipairs(modelo:GetDescendants()) do
-                if d:IsA("ProximityPrompt") then
-                    fireproximityprompt(d)
-                end
+local function fecharLoja()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return false end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+            local nome = d.Name:lower()
+            local texto = ""
+            pcall(function() texto = (d.Text or ""):lower() end)
+            if nome:find("close") or nome:find("fechar") or nome == "x"
+                or texto == "x" or texto:find("close") or texto:find("fechar") then
+                clicarEm(d)
+                return true
             end
         end
-    end)
+    end
+    return false
+end
+
+local function abrirFecharLoja()
+    local loja = acharBotaoLoja()
+    if not loja then return false end
+    clicarEm(loja)
+    task.wait(1.2)
+    if not fecharLoja() then
+        clicarEm(loja) -- alguns jogos o mesmo botao abre e fecha
+    end
     return true
 end
 
-local function guardarOvoNaBase(uid)
-    -- coloca o ovo num slot da base via remote oficial
-    local plot, pen = acharPlot()
-    if not plot then return end
-    local rp = rfPlace()
-    if not rp then return end
-    local baseCF = nil
-    if pen and pen:IsA("BasePart") then
-        baseCF = pen.CFrame
-    else
-        local p = plot.PrimaryPart or plot:FindFirstChildWhichIsA("BasePart", true)
-        if p then baseCF = p.CFrame end
+task.spawn(function()
+    while true do
+        task.wait(120)
+        pcall(function()
+            if esteiraAfk then
+                if abrirFecharLoja() then
+                    print("[KoalaOvo] anti-AFK esteira: loja aberta/fechada")
+                end
+            end
+        end)
     end
-    if not baseCF then return end
-    local offset = CFrame.new(math.random(-6, 6), 2, math.random(-6, 6))
-    chamarRF(rp, { Uid = uid, LocalCFrame = baseCF:ToObjectSpace(baseCF * offset) })
-end
+end)
 
-local function roubarUmaVez()
-    if farmOcupado then return false end
-    farmOcupado = true
-    local ok, erro = pcall(function()
-        atualizarSnapshot(true)
-        local alvo = escolherMelhorOvo()
-        if not alvo then
-            statusAtual = "Nenhum ovo com essa raridade"
-            task.wait(2)
-            return
-        end
-        statusAtual = "Indo ao ovo " .. alvo.Rarity
-        if not irPara(alvo.Pos, 65) then
-            statusAtual = "Nao cheguei no ovo"
-            return
-        end
-        statusAtual = "Pegando " .. alvo.Rarity .. "..."
-        local pegou = false
-        for _ = 1, 12 do
-            tentarPegar(alvo.Uid)
-            task.wait(0.25)
-            local _, uidMao = ovoNaMao()
-            if uidMao then pegou = true break end
-        end
-        if not pegou then
-            statusAtual = "Falha ao pegar (guarda?)"
-            task.wait(1)
-            return
-        end
-        stats.roubados = stats.roubados + 1
-        statusAtual = "Voltando pra base..."
-        local base = posicaoBase()
-        if base then irPara(base, 65) end
-        local _, uidMao = ovoNaMao()
-        if uidMao then
-            guardarOvoNaBase(uidMao)
-        end
-        statusAtual = "Ovo entregue!"
-        task.wait(0.5)
+-- anti-idle padrao (sempre ligado)
+LP.Idled:Connect(function()
+    pcall(function()
+        local VU = game:GetService("VirtualUser")
+        VU:CaptureController()
+        VU:ClickButton2(Vector2.new())
     end)
-    farmOcupado = false
-    cancelarTween()
-    if not ok then
-        statusAtual = "Erro: " .. tostring(erro):sub(1, 40)
-    end
-    return ok
-end
-
-task.spawn(function()
-    while true do
-        local ok, erro = pcall(function()
-            if cfg.autoRoubar and not farmOcupado then
-                roubarUmaVez()
-            end
-        end)
-        if not ok then farmOcupado = false end
-        task.wait(0.5)
-    end
 end)
 
 --==================================================================--
---  AUTO CHOCAR
+--  ESP dos ovos
 --==================================================================--
-task.spawn(function()
-    while true do
-        pcall(function()
-            if cfg.autoChocar then
-                local rh, rf2 = rfHatch(), rfFinish()
-                if rh and rf2 then
-                    local uids = {}
-                    -- ovos colocados na base (live snapshot)
-                    local ok, ret = pcall(function()
-                        local rl = rfLive()
-                        return rl and rl:InvokeServer()
-                    end)
-                    if ok and type(ret) == "table" then
-                        for chave, rec in pairs(ret.Records or ret) do
-                            if type(rec) == "table" then
-                                local uid = rec.Uid or (type(chave) == "string" and chave)
-                                if uid then table.insert(uids, uid) end
-                            end
-                        end
-                    end
-                    -- ovos na mochila tambem tentam chocar
-                    for _, uid in ipairs(ovosNaMochila()) do
-                        table.insert(uids, uid)
-                    end
-                    for _, uid in ipairs(uids) do
-                        if not cfg.autoChocar then break end
-                        local okH = chamarRF(rh, uid)
-                        if okH then
-                            task.wait(0.9)
-                            local okF, retF = chamarRF(rf2, uid)
-                            if okF and retF ~= false then
-                                stats.chocados = stats.chocados + 1
-                                statusAtual = "Chocou um ovo!"
-                            end
-                        end
-                        task.wait(0.1)
-                    end
-                end
-            end
-        end)
-        task.wait(2)
-    end
-end)
-
---==================================================================--
---  AUTO COLOCAR (ovos da mochila -> base)
---==================================================================--
-task.spawn(function()
-    while true do
-        pcall(function()
-            if cfg.autoColocar then
-                for _, uid in ipairs(ovosNaMochila()) do
-                    if not cfg.autoColocar then break end
-                    guardarOvoNaBase(uid)
-                    task.wait(0.2)
-                end
-            end
-        end)
-        task.wait(1.5)
-    end
-end)
-
---==================================================================--
---  AUTO ESTEIRA (upgrada velocidade do personagem no jogo)
---==================================================================--
-task.spawn(function()
-    local montou = false
-    while true do
-        pcall(function()
-            if cfg.autoEsteira then
-                if not montou then
-                    local rd = rfDon()
-                    if rd then chamarRF(rd) end
-                    montou = true
-                end
-                local rw = rfWearStill()
-                if rw then chamarRF(rw, true) end
-                local rt = rfTierUp()
-                if rt then chamarRF(rt) end
-            else
-                montou = false
-            end
-        end)
-        task.wait(1.5)
-    end
-end)
-
---==================================================================--
---  ESP DE OVOS
---==================================================================--
-local espMapa = {} -- modelo -> {hl, bb}
+local espObjs = {}
 
 local function limparESP()
-    for modelo, objs in pairs(espMapa) do
-        pcall(function() objs.hl:Destroy() end)
-        pcall(function() objs.bb:Destroy() end)
-        espMapa[modelo] = nil
+    for _, o in pairs(espObjs) do
+        pcall(function() o.hl:Destroy() end)
+        pcall(function() o.bb:Destroy() end)
     end
-end
-
-local function criarESP(modelo, raridade)
-    local parte = modelo.PrimaryPart or modelo:FindFirstChildWhichIsA("BasePart")
-    if not parte then return end
-    local cor = RAR_COR[raridade] or RAR_COR.Common
-
-    local hl = Instance.new("Highlight")
-    hl.FillColor = cor
-    hl.OutlineColor = cor
-    hl.FillTransparency = 0.65
-    hl.OutlineTransparency = 0.1
-    hl.Adornee = modelo
-    hl.Parent = modelo
-
-    local bb = Instance.new("BillboardGui")
-    bb.Size = UDim2.new(0, 120, 0, 30)
-    bb.StudsOffset = Vector3.new(0, 3, 0)
-    bb.AlwaysOnTop = true
-    bb.Adornee = parte
-
-    local txt = Instance.new("TextLabel")
-    txt.Size = UDim2.new(1, 0, 1, 0)
-    txt.BackgroundTransparency = 1
-    txt.Text = raridade
-    txt.TextColor3 = cor
-    txt.TextStrokeTransparency = 0.3
-    txt.Font = Enum.Font.GothamBold
-    txt.TextSize = 13
-    txt.Parent = bb
-
-    bb.Parent = modelo
-    espMapa[modelo] = { hl = hl, bb = bb }
+    espObjs = {}
 end
 
 task.spawn(function()
     while true do
         pcall(function()
-            if cfg.espOvos then
-                local pasta = Workspace:FindFirstChild("AreaEggSlotsClient")
-                if pasta then
-                    local minIdx = cfg.espSoRaros and (RAR_IDX["Rare"] or 3) or 1
-                    for _, modelo in ipairs(pasta:GetChildren()) do
-                        if modelo:IsA("Model") and not espMapa[modelo] then
-                            local rar = raridadeDoModelo(modelo)
-                            if rar and (RAR_IDX[rar] or 1) >= minIdx then
-                                criarESP(modelo, rar)
-                            end
+            if espLigado then
+                local vistos = {}
+                for _, o in ipairs(atualizarOvos(false)) do
+                    vistos[o.Uid] = true
+                    if not espObjs[o.Uid] then
+                        local pasta = Workspace:FindFirstChild("AreaEggSlotsClient")
+                        local modelo = pasta and pasta:FindFirstChild(tostring(o.Uid))
+                        local parte = modelo and (modelo.PrimaryPart or modelo:FindFirstChildWhichIsA("BasePart"))
+                        if modelo and parte then
+                            local cor = RAR_COR[o.Rar] or RAR_COR.Unknown
+                            local hl = Instance.new("Highlight")
+                            hl.FillColor = cor
+                            hl.OutlineColor = cor
+                            hl.FillTransparency = 0.6
+                            hl.Adornee = modelo
+                            hl.Parent = modelo
+                            local bb = Instance.new("BillboardGui")
+                            bb.Size = UDim2.new(0, 140, 0, 36)
+                            bb.StudsOffset = Vector3.new(0, 3.5, 0)
+                            bb.AlwaysOnTop = true
+                            bb.Adornee = parte
+                            local t = Instance.new("TextLabel")
+                            t.Size = UDim2.new(1, 0, 1, 0)
+                            t.BackgroundTransparency = 1
+                            t.Text = string.format("%s\n%s", tostring(o.Cat), o.Rar)
+                            t.TextColor3 = cor
+                            t.TextStrokeTransparency = 0.3
+                            t.Font = Enum.Font.GothamBold
+                            t.TextSize = 12
+                            t.Parent = bb
+                            bb.Parent = modelo
+                            espObjs[o.Uid] = { hl = hl, bb = bb }
                         end
                     end
                 end
-                -- remove ESP de modelos que sumiram
-                for modelo in pairs(espMapa) do
-                    if not modelo.Parent then
-                        pcall(function() espMapa[modelo].hl:Destroy() end)
-                        pcall(function() espMapa[modelo].bb:Destroy() end)
-                        espMapa[modelo] = nil
+                for uid, o in pairs(espObjs) do
+                    if not vistos[uid] then
+                        pcall(function() o.hl:Destroy() end)
+                        pcall(function() o.bb:Destroy() end)
+                        espObjs[uid] = nil
                     end
                 end
             else
                 limparESP()
             end
         end)
-        task.wait(2)
+        task.wait(3)
     end
 end)
 
 --==================================================================--
---  MOVIMENTO DO PERSONAGEM
---==================================================================--
-RunService.Heartbeat:Connect(function()
-    pcall(function()
-        local hum = pegarHum()
-        if hum then
-            if cfg.velocidade ~= 16 then hum.WalkSpeed = cfg.velocidade end
-            if cfg.pulo ~= 50 then hum.JumpPower = cfg.pulo end
-        end
-    end)
-end)
-
-RunService.Stepped:Connect(function()
-    pcall(function()
-        if cfg.noclip or farmOcupado then
-            local c = LP.Character
-            if c then
-                for _, p in ipairs(c:GetDescendants()) do
-                    if p:IsA("BasePart") then p.CanCollide = false end
-                end
-            end
-        end
-    end)
-end)
-
-game:GetService("UserInputService").JumpRequest:Connect(function()
-    pcall(function()
-        if cfg.puloInfinito then
-            local hum = pegarHum()
-            if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
-        end
-    end)
-end)
-
---==================================================================--
---  ANTI-AFK / ANTI-LAG
---==================================================================--
-LP.Idled:Connect(function()
-    pcall(function()
-        if cfg.antiAfk then
-            local VU = game:GetService("VirtualUser")
-            VU:CaptureController()
-            VU:ClickButton2(Vector2.new())
-        end
-    end)
-end)
-
-local function antiLag()
-    pcall(function()
-        Lighting.GlobalShadows = false
-        Lighting.FogEnd = 9e9
-        for _, d in ipairs(Workspace:GetDescendants()) do
-            if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Smoke") or d:IsA("Fire") or d:IsA("Sparkles") then
-                d.Enabled = false
-            elseif d:IsA("PostEffect") then
-                d.Enabled = false
-            end
-        end
-        local terra = Workspace:FindFirstChildOfClass("Terrain")
-        if terra then
-            terra.Decoration = false
-        end
-    end)
-    aviso("Anti-lag aplicado")
-end
-
---==================================================================--
---  GUI — simples, leve, nome aleatorio
+--  GUI — estilo Miranda Hub (lista + GO/STOP)
 --==================================================================--
 local function paiGUI()
     local ok, hui = pcall(function() return gethui() end)
@@ -702,12 +501,9 @@ local function paiGUI()
     return LP:WaitForChild("PlayerGui")
 end
 
--- se ja existe uma GUI nossa de uma execucao anterior, apaga ela
 pcall(function()
     for _, g in ipairs(paiGUI():GetChildren()) do
-        if g:IsA("ScreenGui") and g:GetAttribute("KoalaOvo") then
-            g:Destroy()
-        end
+        if g:IsA("ScreenGui") and g:GetAttribute("KoalaOvo") then g:Destroy() end
     end
 end)
 
@@ -720,80 +516,141 @@ Gui.IgnoreGuiInset = true
 Gui.DisplayOrder = 50
 Gui.Parent = paiGUI()
 
-local COR = {
-    fundo   = Color3.fromRGB(16, 16, 22),
-    painel  = Color3.fromRGB(24, 24, 34),
-    destaque= Color3.fromRGB(130, 95, 230),
-    ligado  = Color3.fromRGB(60, 200, 110),
-    desligado = Color3.fromRGB(70, 70, 90),
-    texto   = Color3.fromRGB(235, 235, 240),
-    subtexto= Color3.fromRGB(150, 150, 170),
+local C = {
+    fundo    = Color3.fromRGB(18, 18, 26),
+    cartao   = Color3.fromRGB(28, 28, 40),
+    cartaoOn = Color3.fromRGB(40, 40, 58),
+    vermelho = Color3.fromRGB(230, 45, 60),
+    verde    = Color3.fromRGB(60, 210, 120),
+    texto    = Color3.fromRGB(240, 240, 245),
+    sub      = Color3.fromRGB(150, 150, 165),
+    escuro   = Color3.fromRGB(30, 30, 44),
 }
 
--- botao flutuante (abre/fecha)
+-- botao flutuante K
 local BotaoK = Instance.new("TextButton")
-BotaoK.Size = UDim2.new(0, 46, 0, 46)
-BotaoK.Position = UDim2.new(0, 12, 0, 100)
-BotaoK.BackgroundColor3 = COR.destaque
+BotaoK.Size = UDim2.new(0, 44, 0, 44)
+BotaoK.Position = UDim2.new(0, 12, 0, 120)
+BotaoK.BackgroundColor3 = C.vermelho
 BotaoK.Text = "K"
 BotaoK.TextColor3 = Color3.new(1, 1, 1)
 BotaoK.Font = Enum.Font.GothamBold
-BotaoK.TextSize = 22
-BotaoK.ZIndex = 60
+BotaoK.TextSize = 20
 BotaoK.Parent = Gui
 Instance.new("UICorner", BotaoK).CornerRadius = UDim.new(1, 0)
 
--- janela principal
-local Janela = Instance.new("Frame")
-Janela.Size = UDim2.new(0, 320, 0, 440)
-Janela.Position = UDim2.new(0.5, -160, 0.5, -220)
-Janela.BackgroundColor3 = COR.fundo
-Janela.BorderSizePixel = 0
-Janela.Parent = Gui
-Instance.new("UICorner", Janela).CornerRadius = UDim.new(0, 14)
+-- painel
+local Painel = Instance.new("Frame")
+Painel.Size = UDim2.new(0, 320, 0, 420)
+Painel.Position = UDim2.new(0.5, -160, 0.5, -210)
+Painel.BackgroundColor3 = C.fundo
+Painel.BorderSizePixel = 0
+Painel.Parent = Gui
+Instance.new("UICorner", Painel).CornerRadius = UDim.new(0, 16)
 
+-- titulo
 local Titulo = Instance.new("TextLabel")
-Titulo.Size = UDim2.new(1, 0, 0, 40)
-Titulo.BackgroundColor3 = COR.destaque
-Titulo.Text = "  Koala Ovo  v1"
-Titulo.TextColor3 = Color3.new(1, 1, 1)
+Titulo.Size = UDim2.new(1, 0, 0, 46)
+Titulo.BackgroundTransparency = 1
+Titulo.RichText = true
+Titulo.Text = '<font color="rgb(230,45,60)"><b>KOALA</b></font> <font color="rgb(240,240,245)"><b>OVO</b></font>'
 Titulo.Font = Enum.Font.GothamBold
-Titulo.TextSize = 16
-Titulo.TextXAlignment = Enum.TextXAlignment.Left
-Titulo.Parent = Janela
-Instance.new("UICorner", Titulo).CornerRadius = UDim.new(0, 14)
+Titulo.TextSize = 20
+Titulo.Parent = Painel
 
 local Status = Instance.new("TextLabel")
-Status.Size = UDim2.new(1, -20, 0, 24)
-Status.Position = UDim2.new(0, 10, 0, 44)
+Status.Size = UDim2.new(1, -24, 0, 18)
+Status.Position = UDim2.new(0, 12, 0, 44)
 Status.BackgroundTransparency = 1
-Status.Text = "..."
-Status.TextColor3 = COR.subtexto
+Status.Text = statusTxt
+Status.TextColor3 = C.sub
 Status.Font = Enum.Font.Gotham
-Status.TextSize = 12
-Status.TextXAlignment = Enum.TextXAlignment.Left
+Status.TextSize = 11
 Status.TextTruncate = Enum.TextTruncate.AtEnd
-Status.Parent = Janela
+Status.Parent = Painel
 
-local Scroll = Instance.new("ScrollingFrame")
-Scroll.Size = UDim2.new(1, -16, 1, -76)
-Scroll.Position = UDim2.new(0, 8, 0, 70)
-Scroll.BackgroundTransparency = 1
-Scroll.ScrollBarThickness = 4
-Scroll.ScrollBarImageColor3 = COR.destaque
-Scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-Scroll.Parent = Janela
+-- lista de ovos
+local Lista = Instance.new("ScrollingFrame")
+Lista.Size = UDim2.new(1, -20, 1, -190)
+Lista.Position = UDim2.new(0, 10, 0, 68)
+Lista.BackgroundTransparency = 1
+Lista.ScrollBarThickness = 3
+Lista.ScrollBarImageColor3 = C.sub
+Lista.CanvasSize = UDim2.new(0, 0, 0, 0)
+Lista.Parent = Painel
 
-local Layout = Instance.new("UIListLayout")
-Layout.Padding = UDim.new(0, 6)
-Layout.SortOrder = Enum.SortOrder.LayoutOrder
-Layout.Parent = Scroll
+local ListaLayout = Instance.new("UIListLayout")
+ListaLayout.Padding = UDim.new(0, 8)
+ListaLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ListaLayout.Parent = Lista
 
-Layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-    Scroll.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 12)
+ListaLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    Lista.CanvasSize = UDim2.new(0, 0, 0, ListaLayout.AbsoluteContentSize.Y + 10)
 end)
 
--- arrastar (funciona em toque e mouse)
+-- botoes GO / STOP
+local GO = Instance.new("TextButton")
+GO.Size = UDim2.new(0.58, 0, 0, 46)
+GO.Position = UDim2.new(0, 10, 1, -110)
+GO.BackgroundColor3 = C.vermelho
+GO.Text = "GO"
+GO.TextColor3 = Color3.new(1, 1, 1)
+GO.Font = Enum.Font.GothamBold
+GO.TextSize = 18
+GO.Parent = Painel
+Instance.new("UICorner", GO).CornerRadius = UDim.new(0, 12)
+
+local STOP = Instance.new("TextButton")
+STOP.Size = UDim2.new(0.38, 0, 0, 46)
+STOP.Position = UDim2.new(0.60, 10, 1, -110)
+STOP.BackgroundColor3 = C.escuro
+STOP.Text = "STOP"
+STOP.TextColor3 = C.vermelho
+STOP.Font = Enum.Font.GothamBold
+STOP.TextSize = 16
+STOP.Parent = Painel
+Instance.new("UICorner", STOP).CornerRadius = UDim.new(0, 12)
+
+-- mini toggles embaixo
+local function miniToggle(texto, x, inicial, cb)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0.46, 0, 0, 34)
+    b.Position = UDim2.new(x, 10, 1, -52)
+    b.BackgroundColor3 = inicial and C.verde or C.escuro
+    b.TextColor3 = inicial and Color3.new(0, 0, 0) or C.sub
+    b.Text = texto .. (inicial and " ON" or " off")
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.Parent = Painel
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 10)
+    local est = inicial
+    b.MouseButton1Click:Connect(function()
+        est = not est
+        b.BackgroundColor3 = est and C.verde or C.escuro
+        b.TextColor3 = est and Color3.new(0, 0, 0) or C.sub
+        b.Text = texto .. (est and " ON" or " off")
+        cb(est)
+    end)
+    return b
+end
+
+miniToggle("Esteira AFK", 0, true, function(v) esteiraAfk = v end)
+miniToggle("ESP ovos", 0.50, false, function(v) espLigado = v end)
+
+GO.MouseButton1Click:Connect(function()
+    task.spawn(goRoubo)
+end)
+STOP.MouseButton1Click:Connect(function()
+    voando = false
+    noclipFarm = false
+    cancelarTween()
+    statusTxt = "Parado"
+end)
+BotaoK.MouseButton1Click:Connect(function()
+    Painel.Visible = not Painel.Visible
+end)
+
+-- arrastar painel e botao K
 local function arrastavel(alvo, segurador)
     local UIS = game:GetService("UserInputService")
     local arrastando, inicio, posInicio
@@ -810,212 +667,154 @@ local function arrastavel(alvo, segurador)
     UIS.InputChanged:Connect(function(input)
         if arrastando and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - inicio
-            alvo.Position = UDim2.new(posInicio.X.Scale, posInicio.X.Offset + delta.X, posInicio.Y.Scale, posInicio.Y.Offset + delta.Y)
+            alvo.Position = UDim2.new(posInicio.X.Scale, posInicio.X.Offset + delta.X,
+                posInicio.Y.Scale, posInicio.Y.Offset + delta.Y)
         end
     end)
 end
-arrastavel(Janela, Titulo)
+arrastavel(Painel, Titulo)
 arrastavel(BotaoK, BotaoK)
 
-BotaoK.MouseButton1Click:Connect(function()
-    Janela.Visible = not Janela.Visible
-end)
+--==================================================================--
+--  CARTOES DA LISTA
+--==================================================================--
+local cartoes = {} -- uid -> frame
 
--- fabrica de controles
-local function secao(texto)
-    local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1, 0, 0, 22)
-    l.BackgroundTransparency = 1
-    l.Text = texto
-    l.TextColor3 = COR.destaque
-    l.Font = Enum.Font.GothamBold
-    l.TextSize = 13
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.Parent = Scroll
-    return l
-end
+local function montarCartao(ovo)
+    local f = cartoes[ovo.Uid]
+    if not f then
+        f = Instance.new("TextButton")
+        f.Size = UDim2.new(1, 0, 0, 60)
+        f.BackgroundColor3 = C.cartao
+        f.Text = ""
+        f.AutoButtonColor = false
+        f.Parent = Lista
+        Instance.new("UICorner", f).CornerRadius = UDim.new(0, 12)
+        local stroke = Instance.new("UIStroke")
+        stroke.Thickness = 2
+        stroke.Transparency = 1
+        stroke.Parent = f
 
-local function toggle(texto, inicial, callback)
-    local b = Instance.new("TextButton")
-    b.Size = UDim2.new(1, 0, 0, 36)
-    b.BackgroundColor3 = inicial and COR.ligado or COR.desligado
-    b.Text = texto .. (inicial and ": LIGADO" or ": desligado")
-    b.TextColor3 = COR.texto
-    b.Font = Enum.Font.GothamBold
-    b.TextSize = 13
-    b.Parent = Scroll
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
-    local estado = inicial
-    b.MouseButton1Click:Connect(function()
-        estado = not estado
-        b.BackgroundColor3 = estado and COR.ligado or COR.desligado
-        b.Text = texto .. (estado and ": LIGADO" or ": desligado")
-        callback(estado)
-    end)
-    callback(inicial)
-    return b
-end
+        local icone = Instance.new("Frame")
+        icone.Name = "Icone"
+        icone.Size = UDim2.new(0, 42, 0, 42)
+        icone.Position = UDim2.new(0, 9, 0.5, -21)
+        icone.Parent = f
+        Instance.new("UICorner", icone).CornerRadius = UDim.new(0, 10)
+        local letra = Instance.new("TextLabel")
+        letra.Name = "Letra"
+        letra.Size = UDim2.new(1, 0, 1, 0)
+        letra.BackgroundTransparency = 1
+        letra.TextColor3 = Color3.new(1, 1, 1)
+        letra.Font = Enum.Font.GothamBold
+        letra.TextSize = 20
+        letra.Parent = icone
 
-local function botao(texto, callback)
-    local b = Instance.new("TextButton")
-    b.Size = UDim2.new(1, 0, 0, 36)
-    b.BackgroundColor3 = COR.painel
-    b.Text = texto
-    b.TextColor3 = COR.texto
-    b.Font = Enum.Font.GothamBold
-    b.TextSize = 13
-    b.Parent = Scroll
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
-    b.MouseButton1Click:Connect(function() pcall(callback) end)
-    return b
-end
+        local nome = Instance.new("TextLabel")
+        nome.Name = "Nome"
+        nome.Size = UDim2.new(1, -150, 0, 22)
+        nome.Position = UDim2.new(0, 60, 0, 8)
+        nome.BackgroundTransparency = 1
+        nome.TextColor3 = C.texto
+        nome.Font = Enum.Font.GothamBold
+        nome.TextSize = 14
+        nome.TextXAlignment = Enum.TextXAlignment.Left
+        nome.TextTruncate = Enum.TextTruncate.AtEnd
+        nome.Parent = f
 
-local function seletor(texto, opcoes, inicial, callback)
-    local idx = inicial
-    local b = Instance.new("TextButton")
-    b.Size = UDim2.new(1, 0, 0, 36)
-    b.BackgroundColor3 = COR.painel
-    b.TextColor3 = COR.texto
-    b.Font = Enum.Font.GothamBold
-    b.TextSize = 13
-    b.Text = texto .. ": " .. tostring(opcoes[idx])
-    b.Parent = Scroll
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
-    b.MouseButton1Click:Connect(function()
-        idx = idx + 1
-        if idx > #opcoes then idx = 1 end
-        b.Text = texto .. ": " .. tostring(opcoes[idx])
-        callback(opcoes[idx])
-    end)
-    callback(opcoes[idx])
-    return b
-end
+        local rar = Instance.new("TextLabel")
+        rar.Name = "Raridade"
+        rar.Size = UDim2.new(1, -150, 0, 16)
+        rar.Position = UDim2.new(0, 60, 0, 32)
+        rar.BackgroundTransparency = 1
+        rar.Font = Enum.Font.GothamBold
+        rar.TextSize = 11
+        rar.TextXAlignment = Enum.TextXAlignment.Left
+        rar.Parent = f
 
-local function contador(texto, minimo, maximo, passo, inicial, callback)
-    local valor = inicial
-    local quadro = Instance.new("Frame")
-    quadro.Size = UDim2.new(1, 0, 0, 36)
-    quadro.BackgroundColor3 = COR.painel
-    quadro.Parent = Scroll
-    Instance.new("UICorner", quadro).CornerRadius = UDim.new(0, 8)
+        local valor = Instance.new("TextLabel")
+        valor.Name = "Valor"
+        valor.Size = UDim2.new(0, 85, 1, 0)
+        valor.Position = UDim2.new(1, -92, 0, 0)
+        valor.BackgroundTransparency = 1
+        valor.TextColor3 = C.verde
+        valor.Font = Enum.Font.GothamBold
+        valor.TextSize = 13
+        valor.TextXAlignment = Enum.TextXAlignment.Right
+        valor.Parent = f
 
-    local rot = Instance.new("TextLabel")
-    rot.Size = UDim2.new(1, -90, 1, 0)
-    rot.Position = UDim2.new(0, 10, 0, 0)
-    rot.BackgroundTransparency = 1
-    rot.TextColor3 = COR.texto
-    rot.Font = Enum.Font.GothamBold
-    rot.TextSize = 13
-    rot.TextXAlignment = Enum.TextXAlignment.Left
-    rot.Text = texto .. ": " .. tostring(valor)
-    rot.Parent = quadro
-
-    local function mkBtn(txt, xoff, delta)
-        local b = Instance.new("TextButton")
-        b.Size = UDim2.new(0, 36, 0, 26)
-        b.Position = UDim2.new(1, xoff, 0.5, -13)
-        b.BackgroundColor3 = COR.destaque
-        b.Text = txt
-        b.TextColor3 = Color3.new(1, 1, 1)
-        b.Font = Enum.Font.GothamBold
-        b.TextSize = 16
-        b.Parent = quadro
-        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-        b.MouseButton1Click:Connect(function()
-            valor = math.clamp(valor + delta, minimo, maximo)
-            if passo < 1 then valor = math.floor(valor * 10 + 0.5) / 10 end
-            rot.Text = texto .. ": " .. tostring(valor)
-            callback(valor)
+        f.MouseButton1Click:Connect(function()
+            if selecionado == f:GetAttribute("Uid") then
+                selecionado = nil
+            else
+                selecionado = f:GetAttribute("Uid")
+            end
         end)
+        cartoes[ovo.Uid] = f
     end
-    mkBtn("-", -80, -passo)
-    mkBtn("+", -40, passo)
-    callback(inicial)
-    return quadro
+
+    f:SetAttribute("Uid", ovo.Uid)
+    local cor = RAR_COR[ovo.Rar] or RAR_COR.Unknown
+    f.Icone.BackgroundColor3 = cor
+    f.Icone.Letra.Text = ovo.Rar:sub(1, 1):upper()
+    f.Nome.Text = tostring(ovo.Cat)
+    f.Raridade.Text = ovo.Rar
+    f.Raridade.TextColor3 = cor
+    f.Valor.Text = fmtDinheiro(ovo.Ganho)
+    return f
 end
 
---==================================================================--
---  MONTAR GUI
---==================================================================--
-secao("FARM")
-toggle("Auto Roubar", false, function(v) cfg.autoRoubar = v if not v then cancelarTween() farmOcupado = false end end)
-seletor("Raridade minima", RARIDADES, 3, function(v) cfg.raridadeMin = v end)
-botao("Roubar melhor ovo AGORA", function()
-    task.spawn(roubarUmaVez)
-end)
-toggle("Auto Chocar", false, function(v) cfg.autoChocar = v end)
-toggle("Auto Colocar ovos na base", false, function(v) cfg.autoColocar = v end)
-toggle("Auto Esteira (upgrade vel.)", false, function(v) cfg.autoEsteira = v end)
-
-secao("ESP")
-toggle("ESP de ovos", false, function(v) cfg.espOvos = v end)
-toggle("ESP so Rare+", false, function(v) cfg.espSoRaros = v end)
-
-secao("MOVIMENTO")
-contador("Velocidade", 16, 250, 8, 16, function(v) cfg.velocidade = v end)
-contador("Forca do pulo", 50, 250, 10, 50, function(v) cfg.pulo = v end)
-toggle("Pulo infinito", false, function(v) cfg.puloInfinito = v end)
-toggle("Atravessar paredes", false, function(v) cfg.noclip = v end)
-
-secao("TELEPORTE")
-botao("Ir pra minha base", function()
-    local base = posicaoBase()
-    if base then
-        statusAtual = "Indo pra base..."
-        task.spawn(function() irPara(base, 65) end)
-    else
-        aviso("Base nao encontrada")
-    end
-end)
-seletor("Zona", ZONAS, 1, function(v) cfg.zonaAlvo = v end)
-botao("Ir pra zona selecionada", function()
-    task.spawn(function()
-        local lista = atualizarSnapshot(true)
-        local alvo = cfg.zonaAlvo:gsub(" ", ""):lower()
-        for _, rec in ipairs(lista) do
-            local area = tostring(rec.Area or rec.Zone or ""):gsub(" ", ""):lower()
-            if area == alvo then
-                local pos = posicaoDoOvo(rec)
-                if pos then
-                    statusAtual = "Indo pra " .. cfg.zonaAlvo .. "..."
-                    irPara(pos, 65)
-                    return
-                end
+local function atualizarLista()
+    local ovos = atualizarOvos(false)
+    local vivos = {}
+    for i, ovo in ipairs(ovos) do
+        vivos[ovo.Uid] = true
+        local f = montarCartao(ovo)
+        f.LayoutOrder = i
+        local stroke = f:FindFirstChildOfClass("UIStroke")
+        if stroke then
+            if selecionado == ovo.Uid then
+                stroke.Color = RAR_COR[ovo.Rar] or RAR_COR.Unknown
+                stroke.Transparency = 0
+                f.BackgroundColor3 = C.cartaoOn
+            else
+                stroke.Transparency = 1
+                f.BackgroundColor3 = C.cartao
             end
         end
-        aviso("Zona sem ovos no momento")
-    end)
+    end
+    for uid, f in pairs(cartoes) do
+        if not vivos[uid] then
+            pcall(function() f:Destroy() end)
+            cartoes[uid] = nil
+            if selecionado == uid then selecionado = nil end
+        end
+    end
+end
+
+--==================================================================--
+--  LOOPS FINAIS
+--==================================================================--
+task.spawn(function()
+    task.wait(2)
+    atualizarOvos(true)
+    while Gui.Parent do
+        pcall(atualizarLista)
+        task.wait(4)
+        atualizarOvos(true)
+    end
 end)
 
-secao("OUTROS")
-toggle("Anti-AFK", true, function(v) cfg.antiAfk = v end)
-botao("Anti-lag (aplicar uma vez)", antiLag)
-botao("Fechar script", function()
-    cfg.autoRoubar = false cfg.autoChocar = false cfg.autoColocar = false
-    cfg.autoEsteira = false cfg.espOvos = false cfg.noclip = false
-    cancelarTween()
-    limparESP()
-    task.wait(0.3)
-    Gui:Destroy()
-end)
-
--- status ao vivo
 task.spawn(function()
     while Gui.Parent do
         pcall(function()
-            local ovos = #ovosCache
-            Status.Text = string.format("%s  |  roubados: %d  chocados: %d  ovos vistos: %d",
-                statusAtual, stats.roubados, stats.chocados, ovos)
+            Status.Text = string.format("%s  |  pegos: %d", statusTxt, roubados)
         end)
-        task.wait(0.5)
+        task.wait(0.4)
     end
 end)
 
---==================================================================--
---  FIM
---==================================================================--
 if game.PlaceId ~= 107778070777162 then
-    aviso("Aviso: esse script foi feito pro Roube um Ovo (PlaceId diferente aqui)", 5)
+    aviso("Esse script e pro Roube um Ovo (PlaceId diferente aqui)", 5)
 end
-atualizarSnapshot(true)
-aviso("Koala Ovo carregado! Toque no botao K.", 4)
+aviso("Koala Ovo v2 carregado! Botao K abre/fecha.", 4)
