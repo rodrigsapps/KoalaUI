@@ -1,22 +1,18 @@
 --[[
-  KoalaTempo.lua — v1
+  KoalaTempo.lua — v2 (AUTO PLAYER com IA + parada perfeita)
   Script para Pare o Temporizador (PlaceId 139988436996662)
   Parte do Koala Hub — discord.gg/ZRFffEgQQM
 
-  Como funciona (baseado no código decompilado do jogo):
-    * O servidor manda no evento PlayerTurn:
-        args[1] = jogador da vez
-        args[2] = tempoServidorInicio + alvo   <- o instante PERFEITO
-        args[3] = alvo em segundos
-        args[4] = multiplicador de velocidade (modo Hard)
-        args[5] = token/id da rodada
-        args[8] = tabela de alvos (modo contínuo) ou nil
-        args[9] = tolerância (modo contínuo)
-    * O clique legítimo envia:
-        PlayerResponse:Fire(TimeCodec.encode(agora, args[5], args[2]))
-      -> o timestamp vai DENTRO do payload. O script agenda o disparo
-         pro instante exato e codifica o timestamp perfeito.
-    * Modo contínuo: alvo i = args[2] - args[3] + args[8][i].
+  Baseado no código decompilado do jogo:
+    * PlayerTurn: args[2] = instante perfeito (início + alvo),
+      args[3] = alvo em s, args[5] = token, args[8] = alvos (modo contínuo)
+    * Clique legítimo: PlayerResponse:Fire(TimeCodec.encode(t, args[5], args[2]))
+      -> timestamp vai DENTRO do pacote: paramos no tempo exato, sem erro
+    * Entrar na estação = SENTAR na cadeira (Seat) da estação
+    * Sozinho na estação: StartBotMatch:Fire() inicia partida contra IA
+    * Sair: RequestLeaveGameStation:Fire()
+    * "Outra chance" (paga): DenyAnotherChance:Fire() recusa na hora
+    * Vencedor: AnnounceGameWinner args[1] = Player
 
   ATENÇÃO: uso por sua conta e risco.
 ]]
@@ -117,12 +113,19 @@ local function bridge(nome)
 end
 
 local B = {
-  PlayerTurn      = bridge("PlayerTurn"),
-  PlayerResponse  = bridge("PlayerResponse"),
-  SubmitTimer     = bridge("SubmitChosenTimer"),
-  PromptChoose    = bridge("PromptChooseTimer"),
-  GameStarted     = bridge("GameStarted"),
-  GameStopped     = bridge("GameStopped"),
+  PlayerTurn       = bridge("PlayerTurn"),
+  PlayerResponse   = bridge("PlayerResponse"),
+  SubmitTimer      = bridge("SubmitChosenTimer"),
+  PromptChoose     = bridge("PromptChooseTimer"),
+  GameStarted      = bridge("GameStarted"),
+  GameStopped      = bridge("GameStopped"),
+  JoinedStation    = bridge("PlayerJoinedStation"),
+  LeftStation      = bridge("PlayerLeftStation"),
+  StartBotMatch    = bridge("StartBotMatch"),
+  RequestLeave     = bridge("RequestLeaveGameStation"),
+  AnnounceWinner   = bridge("AnnounceGameWinner"),
+  PromptAnother    = bridge("PromptPlayerAnotherChance"),
+  DenyAnother      = bridge("DenyAnotherChance"),
 }
 
 if not (B.PlayerTurn and B.PlayerResponse) then
@@ -135,16 +138,40 @@ end
 --============================================================================--
 local F = {
   AutoParar    = true,
-  AutoEscolher = false,
-  TempoEscolha = 10.0,   -- segundos pra escolher pro oponente
-  CompMs       = 0,      -- compensação fixa em ms
-  CompPing     = false,  -- soma o ping real na compensação
+  AutoFarm     = false,  -- auto player: senta + joga contra IA em loop
+  AutoEscolher = true,
+  TempoEscolha = 10.0,
+  CompMs       = 0,
+  CompPing     = false,
 }
 
-local geracao = 0        -- invalida disparos agendados de turnos antigos
+local geracao = 0
 local ultimoTurno = "nenhum"
-local acertos = 0
 local disparosFeitos = 0
+local vitorias = 0
+local estadoFarm = "desligado"
+
+-- estado da estação (atualizado pelos eventos do jogo)
+local InStation = false
+local InGame = false
+local minhaEstacao = nil
+
+local function hrp()
+  local c = LP.Character
+  return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function hum()
+  local c = LP.Character
+  return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function teleportar(cf)
+  local h = hrp()
+  if h then
+    pcall(function() h.CFrame = cf end)
+  end
+end
 
 local function compensacao()
   local c = F.CompMs / 1000
@@ -157,9 +184,10 @@ local function compensacao()
   return c
 end
 
--- agenda um disparo perfeito: espera até (quando - comp) e manda o timestamp exato
+--============================================================================--
+-- 4) Parada perfeita
+--============================================================================--
 local function agendarDisparo(quando, arg5, arg2, rotulo)
-  geracao = geracao + 0  -- só pra deixar claro que usa a geração atual
   local minhaGer = geracao
   task.spawn(function()
     local alvoLocal = quando - compensacao()
@@ -174,7 +202,6 @@ local function agendarDisparo(quando, arg5, arg2, rotulo)
     end)
     if ok then
       disparosFeitos = disparosFeitos + 1
-      acertos = acertos + 1
       aviso("PARADO no tempo exato! (" .. tostring(rotulo) .. ")", 3)
     else
       aviso("Erro ao disparar: " .. tostring(err):sub(1, 60), 5)
@@ -182,20 +209,16 @@ local function agendarDisparo(quando, arg5, arg2, rotulo)
   end)
 end
 
---============================================================================--
--- 4) Escuta dos eventos do jogo
---============================================================================--
 pcall(function()
   B.PlayerTurn:Connect(function(args)
     if type(args) ~= "table" then return end
     local vezDe   = args[1]
-    local a2      = tonumber(args[2])  -- início + alvo (instante perfeito, modo simples)
-    local a3      = tonumber(args[3])  -- alvo em segundos
-    local a5      = args[5]            -- token da rodada
-    local alvos   = args[8]            -- tabela (modo contínuo) ou nil
+    local a2      = tonumber(args[2])
+    local a3      = tonumber(args[3])
+    local a5      = args[5]
+    local alvos   = args[8]
     if not (a2 and a3 and a5) then return end
 
-    -- novo turno: cancela tudo que estava agendado
     geracao = geracao + 1
 
     if vezDe ~= LP then
@@ -204,7 +227,6 @@ pcall(function()
     end
 
     if type(alvos) == "table" then
-      -- modo contínuo: vários alvos
       local base = a2 - a3
       ultimoTurno = string.format("contínuo: %d alvos", #alvos)
       if not F.AutoParar then return end
@@ -212,19 +234,24 @@ pcall(function()
         local perfeito = base + tonumber(t)
         agendarDisparo(perfeito, a5, a2, "alvo " .. i .. "/" .. #alvos)
       end
-      aviso(string.format("Seu turno! %d alvos agendados nos tempos exatos.", #alvos), 4)
     else
-      -- modo simples: instante perfeito = args[2]
       ultimoTurno = string.format("alvo: %.2fs", a3)
       if not F.AutoParar then return end
       agendarDisparo(a2, a5, a2, string.format("%.2fs", a3))
-      aviso(string.format("Seu turno! Vou parar EXATAMENTE em %.2fs.", a3), 4)
     end
   end)
 end)
 
 pcall(function()
+  B.GameStarted:Connect(function()
+    InGame = true
+    estadoFarm = F.AutoFarm and "partida rolando" or estadoFarm
+  end)
+end)
+
+pcall(function()
   B.GameStopped:Connect(function()
+    InGame = false
     geracao = geracao + 1
     ultimoTurno = "partida encerrada"
   end)
@@ -245,8 +272,157 @@ pcall(function()
   end)
 end)
 
+pcall(function()
+  B.AnnounceWinner:Connect(function(args)
+    if type(args) ~= "table" then return end
+    if args[1] == LP then
+      vitorias = vitorias + 1
+      aviso(string.format("VITÓRIA #%d! Score: %s%%", vitorias, tostring(args[2])), 5)
+    end
+  end)
+end)
+
+-- recusa "outra chance" paga automaticamente (nunca gasta Robux)
+pcall(function()
+  B.PromptAnother:Connect(function(args)
+    if type(args) ~= "table" then return end
+    if args[1] == LP and B.DenyAnother then
+      task.delay(0.5, function()
+        pcall(function() B.DenyAnother:Fire() end)
+      end)
+    end
+  end)
+end)
+
 --============================================================================--
--- 5) UI (WindUI)
+-- 5) Auto Player (farm com IA)
+--============================================================================--
+pcall(function()
+  B.JoinedStation:Connect(function(estacao)
+    InStation = true
+    minhaEstacao = estacao
+    estadoFarm = F.AutoFarm and "na estação" or estadoFarm
+  end)
+end)
+
+pcall(function()
+  B.LeftStation:Connect(function()
+    InStation = false
+    InGame = false
+    minhaEstacao = nil
+  end)
+end)
+
+local function estacaoTemOutroJogador(estacao)
+  local ok, ocupada = pcall(function()
+    local cadeiras = estacao:FindFirstChild("Chairs")
+    if not cadeiras then return false end
+    for _, cadeira in ipairs(cadeiras:GetChildren()) do
+      local seat = cadeira:FindFirstChild("Seat")
+      if seat and seat.Occupant then
+        local dono = seat.Occupant.Parent
+        if dono and dono ~= LP.Character then
+          return true
+        end
+      end
+    end
+    return false
+  end)
+  if ok then return ocupada end
+  return true -- na dúvida, considera ocupada
+end
+
+local function acharEstacaoLivre()
+  local pasta = Workspace:FindFirstChild("GameStations")
+  if not pasta then return nil end
+  for _, categoria in ipairs(pasta:GetChildren()) do
+    for _, estacao in ipairs(categoria:GetChildren()) do
+      local cadeiras = estacao:FindFirstChild("Chairs")
+      if cadeiras and not estacaoTemOutroJogador(estacao) then
+        for _, cadeira in ipairs(cadeiras:GetChildren()) do
+          local seat = cadeira:FindFirstChild("Seat")
+          if seat and not seat.Occupant then
+            return estacao, seat
+          end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function sentarNaCadeira(seat)
+  local h = hrp()
+  local hu = hum()
+  if not (h and hu) then return false end
+  -- teleporta em cima do assento: a física do servidor solda a gente no Seat
+  h.CFrame = seat.CFrame + Vector3.new(0, 1.5, 0)
+  task.wait(0.15)
+  pcall(function() hu.Sit = true end)
+  task.wait(0.35)
+  local occ = seat.Occupant
+  return occ ~= nil and occ.Parent == LP.Character
+end
+
+local function voltarProSpawn()
+  local spawn = LP.RespawnLocation
+  if not spawn then
+    spawn = Workspace:FindFirstChildWhichIsA("SpawnLocation", true)
+  end
+  if spawn then
+    teleportar(spawn.CFrame + Vector3.new(0, 4, 0))
+  end
+end
+
+local ultimoBotFire = 0
+local ultimaTentativaSentar = 0
+
+task.spawn(function()
+  while true do
+    task.wait(0.5)
+    if F.AutoFarm then
+      local okLoop, err = pcall(function()
+        if not InStation then
+          estadoFarm = "procurando estação livre..."
+          local estacao, seat = acharEstacaoLivre()
+          if estacao and seat then
+            if os.clock() - ultimaTentativaSentar > 1.5 then
+              ultimaTentativaSentar = os.clock()
+              estadoFarm = "sentando na estação " .. estacao.Name
+              sentarNaCadeira(seat)
+            end
+          else
+            estadoFarm = "todas as estações ocupadas — esperando"
+            task.wait(2)
+          end
+        elseif not InGame then
+          estadoFarm = "na estação — chamando a IA..."
+          if os.clock() - ultimoBotFire > 2.5 then
+            ultimoBotFire = os.clock()
+            if not estacaoTemOutroJogador(minhaEstacao) then
+              pcall(function() B.StartBotMatch:Fire() end)
+            else
+              estadoFarm = "outro jogador entrou — aguardando"
+            end
+          end
+        else
+          estadoFarm = "jogando contra a IA (parada perfeita ativa)"
+        end
+      end)
+      if not okLoop then
+        estadoFarm = "erro: " .. tostring(err):sub(1, 50)
+        task.wait(1)
+      end
+    else
+      if estadoFarm ~= "desligado" then
+        estadoFarm = "desligado"
+      end
+    end
+  end
+end)
+
+--============================================================================--
+-- 6) UI (WindUI)
 --============================================================================--
 local URLS_UI = {
   "https://raw.githubusercontent.com/rodrigsapps/KoalaUI/main/KoalaUI_v3.lua",
@@ -276,11 +452,11 @@ end
 
 local okWin, Window = pcall(function()
   return Koala:CreateWindow({
-    Title = "Koala Pare o Tempo v1",
+    Title = "Koala Pare o Tempo v2",
     Icon = "timer",
     Author = "discord.gg/ZRFffEgQQM",
     Folder = "KoalaTempo",
-    Size = UDim2.fromOffset(580, 440),
+    Size = UDim2.fromOffset(580, 460),
     Theme = "Dark",
     ToggleKey = Enum.KeyCode.RightControl,
   })
@@ -291,14 +467,45 @@ if not okWin or not Window then
 end
 
 -----------------------------------------------------------
--- Aba Principal
+-- Aba Farm (auto player)
+-----------------------------------------------------------
+local TabFarm = Window:Tab({ Title = "Auto Player", Icon = "bot" })
+
+TabFarm:Section({ Title = "★ Farm automático com IA" })
+TabFarm:Toggle({
+  Title = "AUTO PLAYER (farm com IA)",
+  Desc = "Senta numa estação livre, chama a IA, ganha todas as partidas com parada perfeita e repete. Desligar = sai da estação.",
+  Value = false,
+  Callback = function(v)
+    F.AutoFarm = v
+    if not v then
+      pcall(function() B.RequestLeave:Fire() end)
+      task.delay(0.5, voltarProSpawn)
+      estadoFarm = "desligado"
+    else
+      F.AutoParar = true
+      estadoFarm = "ligando..."
+      aviso("Auto player ligado — vou sentar numa estação e farmar contra a IA.", 4)
+    end
+  end,
+})
+TabFarm:Button({
+  Title = "Sair da estação agora",
+  Callback = function()
+    pcall(function() B.RequestLeave:Fire() end)
+    task.delay(0.5, voltarProSpawn)
+  end,
+})
+
+-----------------------------------------------------------
+-- Aba Auto (parada perfeita)
 -----------------------------------------------------------
 local TabMain = Window:Tab({ Title = "Auto", Icon = "timer" })
 
 TabMain:Section({ Title = "★ Parada perfeita" })
 TabMain:Toggle({
   Title = "AUTO PARAR no tempo exato",
-  Desc = "Quando for sua vez, para o temporizador no instante perfeito sozinho (funciona no modo simples e no contínuo).",
+  Desc = "Quando for sua vez, para o temporizador no instante perfeito sozinho (modo simples e contínuo).",
   Value = true,
   Callback = function(v)
     F.AutoParar = v
@@ -309,7 +516,7 @@ TabMain:Toggle({
 TabMain:Section({ Title = "Compensação de rede" })
 TabMain:Toggle({
   Title = "Compensar ping automaticamente",
-  Desc = "Dispara um pouco antes, descontando seu ping real. Deixe DESLIGADO primeiro — o timestamp vai dentro do pacote, então geralmente não precisa.",
+  Desc = "Dispara um pouco antes, descontando seu ping real. Deixe DESLIGADO primeiro — o timestamp vai dentro do pacote.",
   Value = false,
   Callback = function(v) F.CompPing = v end,
 })
@@ -324,7 +531,7 @@ TabMain:Section({ Title = "Escolha de tempo (vez de escolher)" })
 TabMain:Toggle({
   Title = "Auto escolher tempo pro oponente",
   Desc = "Quando couber a você escolher, envia o valor abaixo automaticamente.",
-  Value = false,
+  Value = true,
   Callback = function(v) F.AutoEscolher = v end,
 })
 TabMain:Slider({
@@ -338,14 +545,21 @@ TabMain:Slider({
 -----------------------------------------------------------
 local TabStatus = Window:Tab({ Title = "Status", Icon = "activity" })
 
+local pFarm     = TabStatus:Paragraph({ Title = "Auto player", Desc = "..." })
+local pWins     = TabStatus:Paragraph({ Title = "Wins (leaderstats)", Desc = "..." })
+local pVitorias = TabStatus:Paragraph({ Title = "Vitórias nesta sessão", Desc = "..." })
 local pTurno    = TabStatus:Paragraph({ Title = "Último turno", Desc = "..." })
 local pDisparos = TabStatus:Paragraph({ Title = "Paradas perfeitas", Desc = "..." })
 local pPing     = TabStatus:Paragraph({ Title = "Ping", Desc = "..." })
-local pRelogio  = TabStatus:Paragraph({ Title = "Relógio do servidor", Desc = "..." })
 
 task.spawn(function()
   while Window do
     pcall(function()
+      pFarm:SetDesc(estadoFarm)
+      local ls = LP:FindFirstChild("leaderstats")
+      local wins = ls and ls:FindFirstChild("Wins")
+      pWins:SetDesc(tostring(wins and wins.Value or "?"))
+      pVitorias:SetDesc(tostring(vitorias))
       pTurno:SetDesc(ultimoTurno)
       pDisparos:SetDesc(string.format("%d disparos perfeitos enviados", disparosFeitos))
       local ok, p = pcall(function() return LP:GetNetworkPing() end)
@@ -354,10 +568,9 @@ task.spawn(function()
       else
         pPing:SetDesc("?")
       end
-      pRelogio:SetDesc(string.format("%.2f", Workspace:GetServerTimeNow()))
     end)
     task.wait(1)
   end
 end)
 
-aviso("Koala Pare o Tempo v1 carregado! Entra numa estação que o resto é automático.", 6)
+aviso("Koala Pare o Tempo v2 carregado! Aba Auto Player liga o farm com IA.", 6)
