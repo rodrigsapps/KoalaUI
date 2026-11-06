@@ -1,0 +1,18 @@
+# Lista de codigos do MM2 (Misterio Assassino 2)
+# Uma linha por codigo. Linhas que comecam com # sao ignoradas.
+# Atualize este arquivo quando sair codigo novo — o script pega sozinho.
+# Fontes: Twitter/X do Nikilis e o Discord oficial do MM2.
+# Codigos historicos (podem estar expirados, mas o script tenta assim mesmo):
+COMB4T2
+PR1SM
+AL3X
+C0RL
+D3NIS
+SK3TCH
+SUB0
+INF3CT3D
+G003Y
+B4CK2SK00L
+N3XTL3V3L
+N3ON
+HW2017
